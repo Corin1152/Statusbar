@@ -71,10 +71,10 @@ static void publishOnce(void)
         double usage = HeliumCPUUsageFraction();
         NSArray<NSNumber *> *perCore = HeliumCPUPerCoreFractions() ?: @[];
 
-        // The real (IOReport) frequency can only be read by the root HUD process.
-        // The main app (mobile) cannot subscribe to IOReport, so it must never
-        // downgrade an "ioreport" reading that the HUD already wrote. Read back the
-        // existing shared file and, if the HUD left a fresh real reading, keep it.
+        // The HUD ("-hud" daemon) is the authoritative publisher of the real
+        // (IOReport) frequency; the main app preserves that reading rather than
+        // replacing it. Read back the existing shared file and, if the HUD left a
+        // fresh real reading, keep it.
         uint64_t existingIOReportMHz = 0;
         NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
         for (NSString *path in sharedMetricPaths()) {
@@ -96,7 +96,7 @@ static void publishOnce(void)
         uint64_t mhz = 0;
         NSString *source = @"probe";
         if (getuid() == 0) {
-            // Root (HUD): read the actual DVFS residency from IOReport.
+            // HUD (root daemon): read the actual DVFS residency from IOReport.
             mhz = helium_real_cpu_frequency_mhz();
             if (mhz > 0) source = @"ioreport";
         }
@@ -145,11 +145,10 @@ void helium_start_cpu_metrics_publisher(void)
                                                        DISPATCH_QUEUE_SERIAL);
 
         // One-shot: write the IOReport / device-tree report so it can be read back
-        // without a debugger. It is written by BOTH processes every time the app
-        // opens, so the file is never stale: the mobile main app writes an
-        // informative report (device-tree DVFS tables + group list, subscription
-        // marked "REFUSED (non-root)"), and the root HUD overwrites it with the
-        // real subscription result. Done off the main thread (building a
+        // without a debugger. Written on every run so the file is never stale.
+        // IOReport subscription is gated by com.apple.private.ioreport.allow (0.15),
+        // not by uid, so whichever process this is attempts the real subscription and
+        // the report shows the truth. Done off the main thread (building a
         // subscription is not free).
         dispatch_async(queue, ^{
             @try { (void)helium_real_cpu_frequency_diagnosis(); } @catch (NSException *e) { }

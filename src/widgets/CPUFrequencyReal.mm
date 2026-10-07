@@ -574,14 +574,13 @@ uint64_t helium_real_cpu_frequency_mhz(void)
     uint64_t result = 0;
 
     @try {
-        // IOReport subscription is only permitted for root. The HUD ("-hud"
-        // LaunchDaemon) runs as root and is the only process that can read CPU
-        // DVFS residency; the main app runs as mobile and every subscription is
-        // refused there (the CPU-temperature widget works for the same reason).
-        // Bail out early so the caller falls back to the busy-loop probe instead
-        // of burning a 100 ms sleep on a subscription that cannot succeed.
-        if (getuid() != 0) return 0;
-
+        // IOReport subscription is gated by the `com.apple.private.ioreport.allow`
+        // entitlement (added in 0.15), NOT by uid: the root "-hud" daemon and the
+        // mobile main app carry the same entitlement, so both may subscribe. We
+        // therefore always try — if the subscription is refused, ensureSymbols /
+        // ensureFreqSubscription fail and we return 0 so the caller falls back to
+        // the busy-loop probe. (Before 0.15 this bailed out early for non-root, but
+        // that was only because the entitlement was missing for every process.)
         if (!ensureSymbols()) return 0;
         if (!ensureFreqSubscription()) return 0;
 
@@ -616,15 +615,24 @@ uint64_t helium_real_cpu_frequency_mhz(void)
 
 NSString *helium_real_cpu_frequency_diagnosis(void)
 {
-    // The root HUD writes the authoritative, subscribable report. If one already
-    // exists on disk, do not let the mobile main app clobber it with a (non-root)
-    // report when the app opens — keep the real one.
-    for (NSString *path in @[ @"/var/mobile/Documents/HeliumCPUFreqDiag.txt",
-                              @"/var/mobile/Media/Downloads/HeliumCPUFreqDiag.txt" ]) {
-        NSString *existing = [NSString stringWithContentsOfFile:path
-                                                       encoding:NSUTF8StringEncoding error:nil];
-        if (existing && [existing rangeOfString:@"process: root"].location != NSNotFound) {
-            return existing;
+    // Write a fresh report on every run, with one exception: a NON-ROOT process must
+    // not downgrade a report that already shows a successful subscription.
+    //
+    // The old guard keyed off the string "process: root". That was a bug: once ANY
+    // root report existed on disk, every later run — including a new root HUD after
+    // a reboot — matched it and returned early, so the file froze forever and never
+    // updated again. Keying off "subscribe=ok" instead means a root process always
+    // rewrites, and a non-root process rewrites too while no successful report
+    // exists yet — so opening the app refreshes the file, but a good report is
+    // never clobbered.
+    if (getuid() != 0) {
+        for (NSString *path in @[ @"/var/mobile/Documents/HeliumCPUFreqDiag.txt",
+                                  @"/var/mobile/Media/Downloads/HeliumCPUFreqDiag.txt" ]) {
+            NSString *existing = [NSString stringWithContentsOfFile:path
+                                                           encoding:NSUTF8StringEncoding error:nil];
+            if (existing && [existing rangeOfString:@"subscribe=ok"].location != NSNotFound) {
+                return existing;
+            }
         }
     }
 
@@ -633,22 +641,15 @@ NSString *helium_real_cpu_frequency_diagnosis(void)
     [out appendFormat:@"device: %@ / iOS %@\n\n",
         [[UIDevice currentDevice] model], [[UIDevice currentDevice] systemVersion]];
 
-    // This report is always written when the app opens, from whichever process
-    // runs it, so the file is never stale. The subscription step below is
-    // root-gated: IOReport subscription requires root (ent.plist has no
-    // com.apple.private.ioreport.allow), so the main app (mobile) cannot subscribe
-    // — only the "-hud" LaunchDaemon (root) can. The CPU-temperature widget works
-    // for exactly this reason.
+    // Written on every run, from whichever process calls it, so the file is never
+    // stale. IOReport access is gated by com.apple.private.ioreport.allow (added in
+    // 0.15), NOT by uid — both the root HUD and the mobile main app carry it, so the
+    // subscription step below is attempted in either process and reports the truth.
     [out appendFormat:@"process: %s (uid=%d)\n",
         getuid() == 0 ? "root (Helium -hud)" : "mobile (main app)", getuid()];
-    if (getuid() != 0) {
-        [out appendString:@"IOReport subscription requires root, so this (mobile) process "
-                       "cannot subscribe — every subscription below is marked REFUSED.\n"];
-        [out appendString:@"The REAL subscription result is written by the \"-hud\" "
-                       "LaunchDaemon (root). After installing, REBOOT the device so the\n"];
-        [out appendString:@"KeepAlive HUD reloads the new binary, then open Statusbar; "
-                       "the HUD overwrites this file with the real report.\n"];
-    }
+    [out appendString:@"IOReport access is gated by com.apple.private.ioreport.allow "
+                   "(added in 0.15), not by uid; subscribing below in whichever process "
+                   "this is.\n"];
     [out appendString:@"\n"];
 
     @try {
@@ -687,8 +688,9 @@ NSString *helium_real_cpu_frequency_diagnosis(void)
 
             // 2. Which of them can actually be subscribed to, and how many channels
             //    each carries (the number the first build got wrong).
-            [out appendString:@"\nSubscription attempts:\n"];
-            BOOL isRoot = (getuid() == 0);
+            [out appendString:@"\nSubscription attempts (CPU-relevant groups only — a subscription\n"];
+            [out appendString:@"cannot be released on this OS, so we do not create hundreds of\n"];
+            [out appendString:@"throwaway ones for unrelated groups):\n"];
             for (NSString *key in keys) {
                 NSArray<NSString *> *parts = [key componentsSeparatedByString:@" | "];
                 if (parts.count != 2) continue;
@@ -700,12 +702,22 @@ NSString *helium_real_cpu_frequency_diagnosis(void)
                 CFIndex count = channelCountOf(probe);
                 if (probe) CFRelease(probe);
 
-                if (!isRoot) {
-                    // Non-root cannot subscribe; report it without wasting a call.
-                    [out appendFormat:@"   %@ : channels=%ld subscribe=REFUSED (non-root)\n",
-                        key, (long)count];
+                // Only groups that could plausibly carry per-cluster clock residency
+                // are worth a live subscription (same keyword set as the discovery
+                // step in ensureFreqSubscription). Everything else is listed above;
+                // subscribing to it would just leak an unreleasable object.
+                NSString *upper = parts[0].uppercaseString;
+                if ([upper rangeOfString:@"CPU"].location == NSNotFound &&
+                    [upper rangeOfString:@"PMP"].location == NSNotFound &&
+                    [upper rangeOfString:@"PERF"].location == NSNotFound &&
+                    [upper rangeOfString:@"CLOCK"].location == NSNotFound &&
+                    [upper rangeOfString:@"DVFS"].location == NSNotFound) {
                     continue;
                 }
+
+                // Attempt the subscription in whichever process this is — the
+                // com.apple.private.ioreport.allow entitlement, not uid, decides
+                // whether it succeeds.
                 IORepSubRef sub = NULL;
                 CFMutableDictionaryRef channels = NULL;
                 BOOL subOK = trySubscribe((__bridge CFStringRef)parts[0], subgroup, &sub, &channels);
@@ -715,12 +727,8 @@ NSString *helium_real_cpu_frequency_diagnosis(void)
             }
 
             // 3. The channel/state layout of whichever group we ended up using.
-            //    Only meaningful when we could actually subscribe (root process).
-            if (getuid() != 0) {
-                [out appendString:@"\nActive group: none — non-root process cannot "
-                               "subscribe. The \"-hud\" (root) LaunchDaemon writes the "
-                               "real active group after a reboot.\n"];
-            } else if (ensureFreqSubscription()) {
+            //    Meaningful only when we could actually subscribe.
+            if (ensureFreqSubscription()) {
                 [out appendFormat:@"\nActive group: %@\n", gActiveGroupDescription ?: @"?"];
                 CFDictionaryRef s = pCreateSamples(gSubscription, gSubscribedChannels, NULL);
                 NSArray *list = copyChannelsArrayFromSample(s);

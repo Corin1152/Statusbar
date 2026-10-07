@@ -99,29 +99,32 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: statusbar-${{ github.run_number }}
-          name: Statusbar 0.15 (build ${{ github.run_number }})
+          name: Statusbar 0.16 (build ${{ github.run_number }})
           body: |
-            基于 Helium 改版。应用名改为 Statusbar，版本从 0.01 起（本次 0.15）。
+            基于 Helium 改版。应用名改为 Statusbar，版本从 0.01 起（本次 0.16）。
 
             界面：只有「首页 / 自定义」两页，首页右上角直接显示版本号（无齿轮/设置入口）。
             部件：原有 9 个 + CPU温度 / CPU占用 / CPU频率 / 蜂窝信号（RSRP）。
 
-            本次改动（让 CPU 频率真正读实时 DVFS 档位）：
-              · 0.14 已让频率部件渲染共享文件（1Hz），与 SysProbe 步进/数值对齐。
-                但真机诊断 `HeliumCPUFreqDiag(3).txt` 显示：即便 HUD 是 root，全部
-                IOReport 组都 `subscribe=REFUSED` —— 单有 root 不够，还需
-                `com.apple.private.ioreport.allow` 私有权限（CPU 温度通道已正常，
-                被拒的是频率用的 `CPU Stats` 组）。
-              · 本版在 `ent.plist` 加入 `com.apple.private.ioreport.allow`（wildcard，
-                SiliconScope / macmon 同款）。TrollStore 放行任意私有权限，签名带上后
-                HUD(root) 即可订阅 `CPU Stats`、读出真实驻留算实时频率——
-                即此刻实际 DVFS 档位（负载高升、空闲降），不再是忙循环测的「可达峰值」。
-              · CPU 频率与占用仍写入共享文件，SysProbe 读同一文件 → 两边 1 秒步进、同数值
-                （HUD root 时均为 IOReport 真实档位）。
+            本次改动（修复「诊断文件不更新」）：
+              · 0.13 为「防止主 App 覆盖 HUD 的真实报告」加了一道守卫：文件里已含
+                `process: root` 就原样返回、不重写。这是个 bug —— 0.14 的 HUD 写过一次后，
+                文件里就永远带着该字符串，之后**任何**进程（包括重启后的新 HUD）都被这道
+                守卫挡住，诊断文件从此永久冻结、再也不会更新。
+              · 本版改为：**root 进程永远重写**；非 root 进程仅在「已有成功订阅报告
+                (`subscribe=ok`)」时才跳过。于是打开 App 即可刷新诊断，同时不会把好报告
+                覆盖成差的。
+              · 0.15 已加 `com.apple.private.ioreport.allow`，而 IOReport 订阅的门槛是
+                **该权限、不是 uid**（SiliconScope/macmon 都是普通 App 带权限即可）。故诊断
+                改为**无论 root 还是 mobile 都真的去订阅**并如实上报（不再一律标
+                REFUSED(non-root)）。
+              · 诊断的订阅尝试**限定到 CPU 相关组**（CPU/PMP/PERF/CLOCK/DVFS）：订阅在本 OS
+                上无法释放，若对全部上千个组都建订阅会残留大量活订阅，故只对可能有频率
+                驻留的组建。
 
             安装：用 TrollStore / 巨魔安装 Statusbar.ipa。
             ⚠️ 装后**重启一次设备**，让 HUD 守护进程加载含新权限的新二进制；打开 Statusbar，
-               HUD(root) 应能写出 `subscribe=ok` 的真实诊断，频率部件显示实时步进。
+               诊断与频率都应刷新（HUD(root) 应写出 `subscribe=ok`）。
 
             使用：Statusbar → Customize → 添加部件。
 
