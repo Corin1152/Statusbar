@@ -99,12 +99,17 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: statusbar-${{ github.run_number }}
-          name: Statusbar 0.07 (build ${{ github.run_number }})
+          name: Statusbar 0.08 (build ${{ github.run_number }})
           body: |
-            基于 Helium 改版。应用名改为 Statusbar，版本从 0.01 起（本次 0.07）。
+            基于 Helium 改版。应用名改为 Statusbar，版本从 0.01 起（本次 0.08）。
 
             界面：只有「首页 / 自定义」两页，设置入口在首页右上角的齿轮。
             部件：原有 9 个 + CPU温度 / CPU占用 / CPU频率 / 蜂窝信号（RSRP）。
+
+            本次改动：
+              · CPU 频率改用 IOReport 读真实运行频率（各性能档位按驻留时间加权），
+                不再只报忙循环测出的「峰值频率」；读不到时回落原探针。
+              · 每秒把 CPU 占用 / 频率发布到共享文件，供 SysProbe 显示同一份数值。
 
             安装：用 TrollStore / 巨魔安装 Statusbar.ipa。
             使用：Statusbar → Customize → 添加部件。

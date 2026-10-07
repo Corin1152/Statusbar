@@ -6,6 +6,7 @@
 #import "Helium-Swift.h"
 
 #import "../widgets/WidgetManager.h"
+#import "../widgets/CPUMetricsPublisher.h"
 #import "../extensions/UsefulFunctions.h"
 #import "../extensions/FontUtils.h"
 #import "../extensions/EZTimer.h"
@@ -355,6 +356,9 @@ static void ReloadHUD
     [_contentView addSubview:_verticalLine];
 
     [self createWidgetSetsView];
+    // Publish this HUD's CPU readings to the shared file so SysProbe can show the
+    // same numbers instead of sampling on its own (see CPUMetricsPublisher.mm).
+    helium_start_cpu_metrics_publisher();
     notify_post(NOTIFY_RELOAD_HUD);
 }
 

@@ -1152,6 +1152,56 @@ static NSString* formattedCPUFrequency(NSInteger unit)
     return [NSString stringWithFormat:@"%.2f GHz", (double)khz / 1000000.0];
 }
 
+// MARK: - Shared-metrics accessors
+
+/*
+ The CPU readings above are file-scope statics, and CPUMetricsPublisher.mm lives in
+ the same binary — so a plain C-linkage accessor is all the publisher needs. They
+ deliberately return the *same* cached values the widgets render, so a second app
+ reading the published file shows exactly what this HUD shows.
+
+ `extern "C"` is required: this file is Objective-C++, and without it the symbols
+ would be name-mangled and CPUMetricsPublisher.mm would fail to link.
+*/
+
+extern "C" double HeliumCPUUsageFraction(void)
+{
+    double *fractions = NULL;
+    natural_t count = 0;
+    if (!cpuBusyFractions(&fractions, &count) || fractions == NULL || count == 0) {
+        return 0.0;
+    }
+    double sum = 0.0;
+    for (natural_t i = 0; i < count; i++) {
+        sum += fractions[i];
+    }
+    return sum / (double)count;
+}
+
+extern "C" NSArray<NSNumber *> *HeliumCPUPerCoreFractions(void)
+{
+    double *fractions = NULL;
+    natural_t count = 0;
+    if (!cpuBusyFractions(&fractions, &count) || fractions == NULL || count == 0) {
+        return @[];
+    }
+    NSMutableArray<NSNumber *> *result = [NSMutableArray arrayWithCapacity:(NSUInteger)count];
+    for (natural_t i = 0; i < count; i++) {
+        [result addObject:@(fractions[i])];
+    }
+    return result;
+}
+
+extern "C" uint64_t HeliumCPUFrequencyKHz(void)
+{
+    return gCPUFrequencyKHz;
+}
+
+extern "C" void HeliumCPUFrequencyKick(void)
+{
+    cpuFrequencyScheduleIfStale();
+}
+
 // MARK: - Cellular signal (RSRP)
 
 /*
