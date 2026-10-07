@@ -58,6 +58,7 @@
 #import <string.h>
 #import <sys/sysctl.h>
 #import <time.h>
+#import <unistd.h>   // getuid — IOReport subscription requires root
 
 /// The device-tree plane name. Written as a literal because the SDK constant is
 /// not exported on iOS.
@@ -573,6 +574,14 @@ uint64_t helium_real_cpu_frequency_mhz(void)
     uint64_t result = 0;
 
     @try {
+        // IOReport subscription is only permitted for root. The HUD ("-hud"
+        // LaunchDaemon) runs as root and is the only process that can read CPU
+        // DVFS residency; the main app runs as mobile and every subscription is
+        // refused there (the CPU-temperature widget works for the same reason).
+        // Bail out early so the caller falls back to the busy-loop probe instead
+        // of burning a 100 ms sleep on a subscription that cannot succeed.
+        if (getuid() != 0) return 0;
+
         if (!ensureSymbols()) return 0;
         if (!ensureFreqSubscription()) return 0;
 
@@ -611,6 +620,34 @@ NSString *helium_real_cpu_frequency_diagnosis(void)
     [out appendString:@"=== Helium real CPU frequency diagnostics ===\n"];
     [out appendFormat:@"device: %@ / iOS %@\n\n",
         [[UIDevice currentDevice] model], [[UIDevice currentDevice] systemVersion]];
+
+    // IOReport subscription requires root. The main app runs as mobile and *every*
+    // group is refused there — a full enumeration would only print a wall of
+    // "REFUSED" and mislead. The CPU-temperature widget works because it lives in
+    // the "-hud" LaunchDaemon (root). So a non-root process writes this honest note
+    // and lets the HUD produce the real report.
+    if (getuid() != 0) {
+        [out appendString:@"IOReport subscription requires root (ent.plist has no "
+                       "com.apple.private.ioreport.allow).\n"];
+        [out appendString:@"This report was generated from the main app (mobile), "
+                       "which cannot subscribe to any group.\n"];
+        [out appendString:@"The CPU-temperature widget works for the same reason it "
+                       "must: it runs inside the \"-hud\" LaunchDaemon, which is root.\n"];
+        [out appendString:@"\nTo get a REAL report:\n"];
+        [out appendString:@"  1. After installing a new build, REBOOT the device so "
+                       "the KeepAlive HUD daemon reloads the new binary.\n"];
+        [out appendString:@"  2. Open Statusbar once; the \"-hud\" process then writes "
+                       "the real diagnosis here (it runs as root).\n"];
+        [out appendString:@"\nNo group could be subscribed to — the real-frequency path "
+                       "is unavailable from this (non-root) process.\n"];
+        for (NSString *path in @[ @"/var/mobile/Documents/HeliumCPUFreqDiag.txt",
+                                  @"/var/mobile/Media/Downloads/HeliumCPUFreqDiag.txt" ]) {
+            @try {
+                [out writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            } @catch (NSException *e) { }
+        }
+        return out;
+    }
 
     @try {
         BOOL ok = ensureSymbols();

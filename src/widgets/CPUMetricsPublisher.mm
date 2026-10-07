@@ -45,6 +45,7 @@
 
 #import <Foundation/Foundation.h>
 #import <dispatch/dispatch.h>
+#import <unistd.h>   // getuid — only the root HUD can read IOReport CPU frequency
 
 // Provided by WidgetManager.mm. These must be declared `extern "C"`: this file is
 // Objective-C++, so a plain extern would be name-mangled and fail to link against
@@ -70,14 +71,38 @@ static void publishOnce(void)
         double usage = HeliumCPUUsageFraction();
         NSArray<NSNumber *> *perCore = HeliumCPUPerCoreFractions() ?: @[];
 
-        // Ask the busy-loop probe for a fresh sample if its cache has expired; the
-        // real (IOReport) reading is taken below and preferred when it works.
-        HeliumCPUFrequencyKick();
+        // The real (IOReport) frequency can only be read by the root HUD process.
+        // The main app (mobile) cannot subscribe to IOReport, so it must never
+        // downgrade an "ioreport" reading that the HUD already wrote. Read back the
+        // existing shared file and, if the HUD left a fresh real reading, keep it.
+        uint64_t existingIOReportMHz = 0;
+        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+        for (NSString *path in sharedMetricPaths()) {
+            NSDictionary *prev = [NSDictionary dictionaryWithContentsOfFile:path];
+            if (prev && [prev[@"freq_source"] isEqualToString:@"ioreport"]) {
+                uint64_t fm = [prev[@"freq_mhz"] unsignedLongLongValue];
+                NSTimeInterval t = [prev[@"ts"] doubleValue];
+                if (fm > 0 && (now - t) < 5.0) { existingIOReportMHz = fm; break; }
+            }
+        }
 
-        uint64_t mhz = helium_real_cpu_frequency_mhz();
-        NSString *source = @"ioreport";
+        uint64_t mhz = 0;
+        NSString *source = @"probe";
+        if (getuid() == 0) {
+            // Root (HUD): read the actual DVFS residency from IOReport.
+            mhz = helium_real_cpu_frequency_mhz();
+            if (mhz > 0) source = @"ioreport";
+        }
+        if (mhz == 0 && existingIOReportMHz > 0) {
+            // Non-root process, but the HUD's real reading is still fresh — preserve it.
+            mhz = existingIOReportMHz;
+            source = @"ioreport";
+        }
         if (mhz == 0) {
-            mhz = HeliumCPUFrequencyKHz() / 1000ull;   // 0 when the probe has no reading yet
+            // Fall back to the busy-loop probe (peak achievable clock, not the live
+            // DVFS step). Honest label: "probe".
+            HeliumCPUFrequencyKick();
+            mhz = HeliumCPUFrequencyKHz() / 1000ull;
             source = @"probe";
         }
 
@@ -113,12 +138,15 @@ void helium_start_cpu_metrics_publisher(void)
                                                        DISPATCH_QUEUE_SERIAL);
 
         // One-shot: write the IOReport / device-tree report so it can be read back
-        // without a debugger. It says whether the real-frequency path resolves on
-        // this device, and which group names to use if it does not. Done off the
-        // main thread because building a subscription is not free.
-        dispatch_async(queue, ^{
-            @try { (void)helium_real_cpu_frequency_diagnosis(); } @catch (NSException *e) { }
-        });
+        // without a debugger. Only the root HUD can subscribe to IOReport, so only
+        // it writes the real report; the main app (mobile) skips this — its attempt
+        // would only produce a "REFUSED" wall. Done off the main thread because
+        // building a subscription is not free.
+        if (getuid() == 0) {
+            dispatch_async(queue, ^{
+                @try { (void)helium_real_cpu_frequency_diagnosis(); } @catch (NSException *e) { }
+            });
+        }
 
         gPublisherTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
         if (!gPublisherTimer) return;

@@ -99,22 +99,29 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: statusbar-${{ github.run_number }}
-          name: Statusbar 0.11 (build ${{ github.run_number }})
+          name: Statusbar 0.12 (build ${{ github.run_number }})
           body: |
-            基于 Helium 改版。应用名改为 Statusbar，版本从 0.01 起（本次 0.11）。
+            基于 Helium 改版。应用名改为 Statusbar，版本从 0.01 起（本次 0.12）。
 
-            界面：只有「首页 / 自定义」两页，设置入口在首页右上角的齿轮。
+            界面：只有「首页 / 自定义」两页，首页右上角直接显示版本号（无齿轮/设置入口）。
             部件：原有 9 个 + CPU温度 / CPU占用 / CPU频率 / 蜂窝信号（RSRP）。
 
-            本次改动：
-              · 修复「装了新版但诊断文件/共享指标不更新」：发布器原来只挂在 HUD
-                进程（LaunchDaemon 用 `Helium -hud` 启动，KeepAlive）的启动路径上，
-                而 HUD 进程在 TrollStore 覆盖安装后仍跑旧二进制（要重启设备才换）。
-                现在**主 App 启动时也启动发布器** —— 打开一次 App 即生效，无需重启。
-              · 首页右上角不再有齿轮按钮，改为直接显示版本号（位置不变）。
-                原来的「关于」页（版本号 + 致谢 + GPL 说明）整页移除。
+            本次改动（CPU 频率取数口径修正）：
+              · 诊断回传确认：IOReport 订阅**必须 root**。ent.plist 没有
+                com.apple.private.ioreport.allow，所以只有 HUD 进程（`-hud`
+                LaunchDaemon，以 root 运行）能订阅 IOReport 读真实 DVFS 频率；
+                主 App（mobile）订阅一律 REFUSED。温度部件能读也是因为它在 HUD 里。
+              · 因此真实频率改为**只在 HUD(root) 里读**，主 App 不再尝试 IOReport，
+                避免写入「REFUSED」式误导诊断；主 App 只发布占用率，并保留 HUD
+                写出的真实频率（不回退成探针值），两个进程不再互相覆盖抖动。
+              · 诊断文件现在由 HUD(root) 写出真实结果；主 App 写出诚实说明。
+              · P/E 簇 DVFS 表已能在设备树 voltage-states5-sram 找到
+                (453/852/1332/1812/2064/2304/2376 MHz)。
 
             安装：用 TrollStore / 巨魔安装 Statusbar.ipa。
+            ⚠️ 安装后**重启一次设备**，让 KeepAlive 的 HUD 守护进程加载新二进制；
+               之后打开 Statusbar，HUD 会以 root 写真实频率与真实诊断。
+
             使用：Statusbar → Customize → 添加部件。
 
             说明：
