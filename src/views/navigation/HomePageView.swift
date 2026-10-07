@@ -14,12 +14,6 @@ struct HomePageView: View {
   @State private var buttonDisabled: Bool = false
   @State private var inProgress = false
 
-  /// 设置面板。
-  ///
-  /// 以前设置是第三个分页；现在只有「首页 / 自定义」两页，入口挪到首页右上角的齿轮。
-  /// 这样底栏少一个图标，而设置本来也不是一个「页」—— 它是一个模态。
-  @State private var showingSettings = false
-
   var body: some View {
     NavigationView {
       VStack(spacing: 10) {
@@ -101,18 +95,16 @@ struct HomePageView: View {
       })
       .navigationTitle(Text(NSLocalizedString("Statusbar", comment: "")))
       .toolbar {
+        // 右上角原来是一个齿轮，点开是「关于」页。整页「关于」已移除，
+        // 这里改为直接显示版本号 —— 位置不变，但不再是一个可点的入口。
         ToolbarItem(placement: .navigationBarTrailing) {
-          Button {
-            showingSettings = true
-          } label: {
-            Image(systemName: "gear")
-          }
-          .accessibilityLabel(Text(NSLocalizedString("Settings", comment: "")))
+          Text(Bundle.main.releaseVersionNumber ?? "—")
+            .font(.footnote)
+            .foregroundColor(.secondary)
         }
       }
     }
     .navigationViewStyle(StackNavigationViewStyle())
-    .sheet(isPresented: $showingSettings) { SettingsView() }
     .animation(.timingCurve(0.25, 0.1, 0.35, 1.75).speed(1.2), value: isNowEnabled)
     .animation(.timingCurve(0.25, 0.1, 0.35, 1.75).speed(1.2), value: inProgress)
   }
