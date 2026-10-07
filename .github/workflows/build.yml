@@ -99,23 +99,24 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: statusbar-${{ github.run_number }}
-          name: Statusbar 0.13 (build ${{ github.run_number }})
+          name: Statusbar 0.14 (build ${{ github.run_number }})
           body: |
-            基于 Helium 改版。应用名改为 Statusbar，版本从 0.01 起（本次 0.13）。
+            基于 Helium 改版。应用名改为 Statusbar，版本从 0.01 起（本次 0.14）。
 
             界面：只有「首页 / 自定义」两页，首页右上角直接显示版本号（无齿轮/设置入口）。
             部件：原有 9 个 + CPU温度 / CPU占用 / CPU频率 / 蜂窝信号（RSRP）。
 
-            本次改动（修复「诊断文件不更新」）：
-              · 上一版让主 App(mobile) 跳过写诊断，导致打开 App 时文件不更新
-                （HUD 还跑旧二进制、没重启）。0.13 改为：**每次打开 App 都重写诊断**，
-                且写得信息充分 —— 设备树 DVFS 表 + IOReport 组列表在 mobile 下也能
-                枚举，仅「订阅」那一步标注 `REFUSED (non-root)`，不再是一墙无上下文的
-                REFUSED。HUD(root) 启动后会用真实订阅结果覆盖此文件。
-              · 主 App 写诊断前会先看是否已存在 root 写出的真实报告，有则保留，
-                不回退覆盖。
-              · 真实频率仍只在 HUD(root) 读（IOReport 需 root）；主 App 不碰 IOReport，
-                并保留 HUD 写出的新鲜 ioreport 读数。
+            本次改动（让 CPU 频率步进与 SysProbe 对齐到 1 秒）：
+              · **CPU 频率部件改为渲染共享文件里的频率**，而不是自己的 3 秒忙循环探针。
+                共享文件由 CPUMetricsPublisher 每 1 秒写一次：当 HUD 以 root 守护进程
+                运行时，频率取自 IOReport 的真实 DVFS 驻留（当前实际档位）；
+                主 App(mobile) 无 root，则由 HUD 的读数兜底。SysProbe 读的就是同一个
+                文件，于是两边频率步进都是 1 秒、数值完全一致。
+              · 原来的忙循环探针降级为「冷启动兜底」——只在共享文件缺失或过期
+                （启动后前 0.5 秒、或发布器未运行）时才用，不再每个红染周期都跑，
+                因此状态栏读数不再为了保持高频而持续顶着性能核。
+              · 频率读数是「当前 DVFS 档位（IOReport 真实驻留）」，不是探针测出的
+                「可达峰值」。两者数值可能不同：IOReport 更贴近此刻真实频率，属预期。
 
             安装：用 TrollStore / 巨魔安装 Statusbar.ipa。
             ⚠️ 想看「真实订阅结果」：安装后**重启一次设备**，HUD 守护进程加载新二进制，
@@ -126,7 +127,8 @@ jobs:
 
             说明：
               · 温度显示 ??ºC 表示该机型读不到 CPU die 温度通道，属预期降级。
-              · 占用率与频率显示 -- 表示还没有采到样（频率每 3 秒实测一次）。
+              · 占用率显示 -- 表示还没采到样；频率显示 -- 表示共享文件暂无新鲜读数
+                （启动后前 0.5 秒），随后即为 1 秒步进的 IOReport 频率。
               · 蜂窝信号显示 -- 时，进该部件的设置页看「状态」一行：
                 「不可用」说明 CommCenter 权限没生效，不是没有信号。
 

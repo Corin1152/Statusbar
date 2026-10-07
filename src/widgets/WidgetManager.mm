@@ -1080,6 +1080,10 @@ static NSString* formattedCPUUsage(NSInteger mode, BOOL showPercentage, NSIntege
 
 // MARK: - CPU frequency
 
+// The formatter reads the shared file (written by CPUMetricsPublisher at 1 Hz,
+// IOReport-sourced when the HUD is root) as its primary source, so it matches
+// SysProbe step-for-step. The local probe below is only the cold-start fallback.
+//
 // kHz; 0 means "no usable reading yet". An integer rather than a double so the
 // sampling queue and the render path can share it without a lock — a naturally
 // aligned 64-bit load/store is atomic on arm64, and this is only ever a hint for a
@@ -1134,14 +1138,61 @@ static void cpuFrequencyScheduleIfStale(void)
 }
 
 /// `unit`: 0 = GHz, 1 = MHz.
+///
+/// **Source: the shared file written by CPUMetricsPublisher at 1 Hz.**
+///
+/// The publisher (in this same HUD process) samples once a second and, when the
+/// HUD is running as root, sources the clock from IOReport's real DVFS residency —
+/// the actual current frequency step, not the peak a busy loop can coax out of the
+/// core. That is also the exact figure SysProbe renders, so the two readouts step
+/// together at 1 Hz instead of drifting. We read that file here rather than keeping
+/// our own 3 s probe, so the widget and SysProbe can never disagree on frequency.
+///
+/// The local busy-loop probe (`gCPUFrequencyKHz`) survives only as a fallback for
+/// the first half-second after launch (the publisher's first write lands ~0.5 s
+/// in) or if the shared file is ever missing or stale. It is no longer the primary
+/// path, so it can no longer keep the core boosted just to feed a status-bar number.
+static uint64_t heliumSharedCPUFrequencyMHz(void)
+{
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    uint64_t best = 0;
+    for (NSString *path in @[ @"/var/tmp/cpu_metrics.json",
+                              @"/var/mobile/Library/Caches/cpu_metrics.json" ]) {
+        // The shared file is JSON (NSJSONSerialization), not a plist — so
+        // dictionaryWithContentsOfFile: would return nil. Parse it as JSON.
+        NSData *data = [NSData dataWithContentsOfFile:path];
+        if (!data) continue;
+        NSError *err = nil;
+        NSDictionary *prev = [NSJSONSerialization JSONObjectWithData:data options:0 error:&err];
+        if (![prev isKindOfClass:[NSDictionary class]]) continue;
+        NSNumber *fmNum = prev[@"freq_mhz"];
+        NSNumber *tsNum = prev[@"ts"];
+        if (!fmNum || !tsNum) continue;
+        uint64_t fm = [fmNum unsignedLongLongValue];
+        NSTimeInterval t = [tsNum doubleValue];
+        // 5 s freshness to match the publisher's own preserve-window; pick the
+        // freshest file that actually carries a reading.
+        if (fm > 0 && (now - t) < 5.0 && fm > best) {
+            best = fm;
+        }
+    }
+    return best;
+}
+
 static NSString* formattedCPUFrequency(NSInteger unit)
 {
-    // Never block the render path: ask for a fresh sample, then report whatever the
-    // last one produced. The first redraw after launch therefore shows "--" and the
-    // next one shows a number.
-    cpuFrequencyScheduleIfStale();
+    uint64_t khz = 0;
+    uint64_t sharedMHz = heliumSharedCPUFrequencyMHz();
+    if (sharedMHz > 0) {
+        // Primary: the 1 Hz shared-file value (IOReport when the HUD is root).
+        khz = sharedMHz * 1000ull;
+    } else {
+        // Fallback: only while the shared file is missing/stale. Kick the local
+        // probe so a cold start still resolves to a number after one redraw.
+        cpuFrequencyScheduleIfStale();
+        khz = gCPUFrequencyKHz;
+    }
 
-    uint64_t khz = gCPUFrequencyKHz;
     if (khz == 0) {
         return @"--";
     }

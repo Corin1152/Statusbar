@@ -78,8 +78,15 @@ static void publishOnce(void)
         uint64_t existingIOReportMHz = 0;
         NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
         for (NSString *path in sharedMetricPaths()) {
-            NSDictionary *prev = [NSDictionary dictionaryWithContentsOfFile:path];
-            if (prev && [prev[@"freq_source"] isEqualToString:@"ioreport"]) {
+            // The shared file is JSON (NSJSONSerialization), not a plist — so
+            // dictionaryWithContentsOfFile: returns nil and would drop the HUD's
+            // real reading. Parse it as JSON.
+            NSData *data = [NSData dataWithContentsOfFile:path];
+            if (!data) continue;
+            NSError *err = nil;
+            NSDictionary *prev = [NSJSONSerialization JSONObjectWithData:data options:0 error:&err];
+            if (![prev isKindOfClass:[NSDictionary class]]) continue;
+            if ([prev[@"freq_source"] isEqualToString:@"ioreport"]) {
                 uint64_t fm = [prev[@"freq_mhz"] unsignedLongLongValue];
                 NSTimeInterval t = [prev[@"ts"] doubleValue];
                 if (fm > 0 && (now - t) < 5.0) { existingIOReportMHz = fm; break; }
