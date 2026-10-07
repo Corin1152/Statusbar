@@ -99,28 +99,28 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: statusbar-${{ github.run_number }}
-          name: Statusbar 0.12 (build ${{ github.run_number }})
+          name: Statusbar 0.13 (build ${{ github.run_number }})
           body: |
-            基于 Helium 改版。应用名改为 Statusbar，版本从 0.01 起（本次 0.12）。
+            基于 Helium 改版。应用名改为 Statusbar，版本从 0.01 起（本次 0.13）。
 
             界面：只有「首页 / 自定义」两页，首页右上角直接显示版本号（无齿轮/设置入口）。
             部件：原有 9 个 + CPU温度 / CPU占用 / CPU频率 / 蜂窝信号（RSRP）。
 
-            本次改动（CPU 频率取数口径修正）：
-              · 诊断回传确认：IOReport 订阅**必须 root**。ent.plist 没有
-                com.apple.private.ioreport.allow，所以只有 HUD 进程（`-hud`
-                LaunchDaemon，以 root 运行）能订阅 IOReport 读真实 DVFS 频率；
-                主 App（mobile）订阅一律 REFUSED。温度部件能读也是因为它在 HUD 里。
-              · 因此真实频率改为**只在 HUD(root) 里读**，主 App 不再尝试 IOReport，
-                避免写入「REFUSED」式误导诊断；主 App 只发布占用率，并保留 HUD
-                写出的真实频率（不回退成探针值），两个进程不再互相覆盖抖动。
-              · 诊断文件现在由 HUD(root) 写出真实结果；主 App 写出诚实说明。
-              · P/E 簇 DVFS 表已能在设备树 voltage-states5-sram 找到
-                (453/852/1332/1812/2064/2304/2376 MHz)。
+            本次改动（修复「诊断文件不更新」）：
+              · 上一版让主 App(mobile) 跳过写诊断，导致打开 App 时文件不更新
+                （HUD 还跑旧二进制、没重启）。0.13 改为：**每次打开 App 都重写诊断**，
+                且写得信息充分 —— 设备树 DVFS 表 + IOReport 组列表在 mobile 下也能
+                枚举，仅「订阅」那一步标注 `REFUSED (non-root)`，不再是一墙无上下文的
+                REFUSED。HUD(root) 启动后会用真实订阅结果覆盖此文件。
+              · 主 App 写诊断前会先看是否已存在 root 写出的真实报告，有则保留，
+                不回退覆盖。
+              · 真实频率仍只在 HUD(root) 读（IOReport 需 root）；主 App 不碰 IOReport，
+                并保留 HUD 写出的新鲜 ioreport 读数。
 
             安装：用 TrollStore / 巨魔安装 Statusbar.ipa。
-            ⚠️ 安装后**重启一次设备**，让 KeepAlive 的 HUD 守护进程加载新二进制；
-               之后打开 Statusbar，HUD 会以 root 写真实频率与真实诊断。
+            ⚠️ 想看「真实订阅结果」：安装后**重启一次设备**，HUD 守护进程加载新二进制，
+               打开 Statusbar，HUD(root) 写出 `subscribe=ok` 的真实诊断。
+               不重启也能看：打开 App 即得到信息充分的 mobile 版诊断（表 + 组列表）。
 
             使用：Statusbar → Customize → 添加部件。
 

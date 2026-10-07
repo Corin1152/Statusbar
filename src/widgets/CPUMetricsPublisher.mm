@@ -138,15 +138,15 @@ void helium_start_cpu_metrics_publisher(void)
                                                        DISPATCH_QUEUE_SERIAL);
 
         // One-shot: write the IOReport / device-tree report so it can be read back
-        // without a debugger. Only the root HUD can subscribe to IOReport, so only
-        // it writes the real report; the main app (mobile) skips this — its attempt
-        // would only produce a "REFUSED" wall. Done off the main thread because
-        // building a subscription is not free.
-        if (getuid() == 0) {
-            dispatch_async(queue, ^{
-                @try { (void)helium_real_cpu_frequency_diagnosis(); } @catch (NSException *e) { }
-            });
-        }
+        // without a debugger. It is written by BOTH processes every time the app
+        // opens, so the file is never stale: the mobile main app writes an
+        // informative report (device-tree DVFS tables + group list, subscription
+        // marked "REFUSED (non-root)"), and the root HUD overwrites it with the
+        // real subscription result. Done off the main thread (building a
+        // subscription is not free).
+        dispatch_async(queue, ^{
+            @try { (void)helium_real_cpu_frequency_diagnosis(); } @catch (NSException *e) { }
+        });
 
         gPublisherTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
         if (!gPublisherTimer) return;

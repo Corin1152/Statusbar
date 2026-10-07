@@ -616,38 +616,40 @@ uint64_t helium_real_cpu_frequency_mhz(void)
 
 NSString *helium_real_cpu_frequency_diagnosis(void)
 {
+    // The root HUD writes the authoritative, subscribable report. If one already
+    // exists on disk, do not let the mobile main app clobber it with a (non-root)
+    // report when the app opens — keep the real one.
+    for (NSString *path in @[ @"/var/mobile/Documents/HeliumCPUFreqDiag.txt",
+                              @"/var/mobile/Media/Downloads/HeliumCPUFreqDiag.txt" ]) {
+        NSString *existing = [NSString stringWithContentsOfFile:path
+                                                       encoding:NSUTF8StringEncoding error:nil];
+        if (existing && [existing rangeOfString:@"process: root"].location != NSNotFound) {
+            return existing;
+        }
+    }
+
     NSMutableString *out = [NSMutableString string];
     [out appendString:@"=== Helium real CPU frequency diagnostics ===\n"];
     [out appendFormat:@"device: %@ / iOS %@\n\n",
         [[UIDevice currentDevice] model], [[UIDevice currentDevice] systemVersion]];
 
-    // IOReport subscription requires root. The main app runs as mobile and *every*
-    // group is refused there — a full enumeration would only print a wall of
-    // "REFUSED" and mislead. The CPU-temperature widget works because it lives in
-    // the "-hud" LaunchDaemon (root). So a non-root process writes this honest note
-    // and lets the HUD produce the real report.
+    // This report is always written when the app opens, from whichever process
+    // runs it, so the file is never stale. The subscription step below is
+    // root-gated: IOReport subscription requires root (ent.plist has no
+    // com.apple.private.ioreport.allow), so the main app (mobile) cannot subscribe
+    // — only the "-hud" LaunchDaemon (root) can. The CPU-temperature widget works
+    // for exactly this reason.
+    [out appendFormat:@"process: %s (uid=%d)\n",
+        getuid() == 0 ? "root (Helium -hud)" : "mobile (main app)", getuid()];
     if (getuid() != 0) {
-        [out appendString:@"IOReport subscription requires root (ent.plist has no "
-                       "com.apple.private.ioreport.allow).\n"];
-        [out appendString:@"This report was generated from the main app (mobile), "
-                       "which cannot subscribe to any group.\n"];
-        [out appendString:@"The CPU-temperature widget works for the same reason it "
-                       "must: it runs inside the \"-hud\" LaunchDaemon, which is root.\n"];
-        [out appendString:@"\nTo get a REAL report:\n"];
-        [out appendString:@"  1. After installing a new build, REBOOT the device so "
-                       "the KeepAlive HUD daemon reloads the new binary.\n"];
-        [out appendString:@"  2. Open Statusbar once; the \"-hud\" process then writes "
-                       "the real diagnosis here (it runs as root).\n"];
-        [out appendString:@"\nNo group could be subscribed to — the real-frequency path "
-                       "is unavailable from this (non-root) process.\n"];
-        for (NSString *path in @[ @"/var/mobile/Documents/HeliumCPUFreqDiag.txt",
-                                  @"/var/mobile/Media/Downloads/HeliumCPUFreqDiag.txt" ]) {
-            @try {
-                [out writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
-            } @catch (NSException *e) { }
-        }
-        return out;
+        [out appendString:@"IOReport subscription requires root, so this (mobile) process "
+                       "cannot subscribe — every subscription below is marked REFUSED.\n"];
+        [out appendString:@"The REAL subscription result is written by the \"-hud\" "
+                       "LaunchDaemon (root). After installing, REBOOT the device so the\n"];
+        [out appendString:@"KeepAlive HUD reloads the new binary, then open Statusbar; "
+                       "the HUD overwrites this file with the real report.\n"];
     }
+    [out appendString:@"\n"];
 
     @try {
         BOOL ok = ensureSymbols();
@@ -686,6 +688,7 @@ NSString *helium_real_cpu_frequency_diagnosis(void)
             // 2. Which of them can actually be subscribed to, and how many channels
             //    each carries (the number the first build got wrong).
             [out appendString:@"\nSubscription attempts:\n"];
+            BOOL isRoot = (getuid() == 0);
             for (NSString *key in keys) {
                 NSArray<NSString *> *parts = [key componentsSeparatedByString:@" | "];
                 if (parts.count != 2) continue;
@@ -697,6 +700,12 @@ NSString *helium_real_cpu_frequency_diagnosis(void)
                 CFIndex count = channelCountOf(probe);
                 if (probe) CFRelease(probe);
 
+                if (!isRoot) {
+                    // Non-root cannot subscribe; report it without wasting a call.
+                    [out appendFormat:@"   %@ : channels=%ld subscribe=REFUSED (non-root)\n",
+                        key, (long)count];
+                    continue;
+                }
                 IORepSubRef sub = NULL;
                 CFMutableDictionaryRef channels = NULL;
                 BOOL subOK = trySubscribe((__bridge CFStringRef)parts[0], subgroup, &sub, &channels);
@@ -706,7 +715,12 @@ NSString *helium_real_cpu_frequency_diagnosis(void)
             }
 
             // 3. The channel/state layout of whichever group we ended up using.
-            if (ensureFreqSubscription()) {
+            //    Only meaningful when we could actually subscribe (root process).
+            if (getuid() != 0) {
+                [out appendString:@"\nActive group: none — non-root process cannot "
+                               "subscribe. The \"-hud\" (root) LaunchDaemon writes the "
+                               "real active group after a reboot.\n"];
+            } else if (ensureFreqSubscription()) {
                 [out appendFormat:@"\nActive group: %@\n", gActiveGroupDescription ?: @"?"];
                 CFDictionaryRef s = pCreateSamples(gSubscription, gSubscribedChannels, NULL);
                 NSArray *list = copyChannelsArrayFromSample(s);
