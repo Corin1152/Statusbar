@@ -17,12 +17,26 @@
 //  voltage-states table) and you get the average clock over the sampling window —
 //  which is the number powermetrics prints.
 //
+//  ## What the device told us (iPhone / iOS 16.5.1, first diagnosis run)
+//
+//    * every IOReport symbol resolves, including the State API -> the library is
+//      present and callable;
+//    * IOReportCopyAllChannels returns {QueryOpts, IOReportChannels} — the channel
+//      list lives in the **IOReportChannels array**, so counting the outer
+//      dictionary's keys (always 2) says nothing about how many channels a group
+//      has. That miscount is why the first build reported "channels=yes" and then
+//      had every subscription refused;
+//    * subscribing to "CPU Stats" was refused -> the group does not carry channels
+//      under that name on iOS, so names are now *discovered*, not assumed;
+//    * voltage-states was not found under AppleARMIODevice -> the DVFS lookup now
+//      walks the whole device tree instead of guessing a node.
+//
 //  ## The chain, and why every step is optional
 //
 //    1. resolve IOReport's private symbols (dlopen/dlsym; missing -> degrade)
-//    2. subscribe to group "CPU Stats" / subgroup "CPU Complex Performance States"
+//    2. discover the group that actually carries per-cluster DVFS residency
 //    3. take two samples 100 ms apart and diff them -> residency per state
-//    4. read voltage-states*-sram from IORegistry's AppleARMIODevice -> freq per state
+//    4. read the DVFS frequency table -> freq per state
 //    5. weight: freq = sum(residency_i * freq_i) / sum(residency_i)
 //
 //  Any step failing returns 0 so the caller falls back to the busy-loop probe.
@@ -35,15 +49,6 @@
 //  one can take the HUD down — so the subscription is created **once** and reused.
 //  Channel sets and samples are ordinary CF objects and are released normally.
 //
-//  ## What still needs verification on device
-//
-//  The group / subgroup / state-key names below are taken from **measured macOS
-//  (M-series) results** — kennss/SiliconScope's ioreport-channels.md and
-//  vladkens/macmon. **Whether iOS / A-series uses the same names is NOT verified.**
-//  So the code tries a list of candidates rather than hard-coding one, and
-//  helium_real_cpu_frequency_diagnosis() dumps every group/channel/state it could
-//  actually enumerate. One run on the device tells us which name to use.
-//
 
 #import "CPUFrequencyReal.h"
 
@@ -53,6 +58,10 @@
 #import <string.h>
 #import <sys/sysctl.h>
 #import <time.h>
+
+/// The device-tree plane name. Written as a literal because the SDK constant is
+/// not exported on iOS.
+static const char *const kDeviceTreePlane = "IODeviceTree";
 
 // ---------------------------------------------------------------------------
 // IOReport symbols (private; resolved at runtime)
@@ -84,10 +93,12 @@ typedef unsigned int io_registry_entry_t;
 
 typedef CFMutableDictionaryRef (*fn_IOServiceMatching)(const char *);
 typedef int (*fn_IOServiceGetMatchingServices)(mach_port_t, CFDictionaryRef, io_iterator_t *);
+typedef int (*fn_IORegistryCreateIterator)(mach_port_t, const char *, uint32_t, io_iterator_t *);
 typedef io_object_t (*fn_IOIteratorNext)(io_iterator_t);
 typedef int (*fn_IOObjectRelease)(io_object_t);
 typedef CFTypeRef (*fn_IORegistryEntryCreateCFProperty)(io_registry_entry_t, CFStringRef, CFAllocatorRef, uint32_t);
-typedef io_registry_entry_t (*fn_IORegistryEntryFromPath)(mach_port_t, CFStringRef);
+typedef int (*fn_IORegistryEntryCreateCFProperties)(io_registry_entry_t, CFMutableDictionaryRef *, CFAllocatorRef, uint32_t);
+typedef int (*fn_IORegistryEntryGetPath)(io_registry_entry_t, const char *, char *);
 
 static BOOL gSymbolsTried = NO;
 static BOOL gSymbolsOK = NO;
@@ -108,10 +119,12 @@ static fn_StateGetResidency pStateGetResidency = NULL;
 
 static fn_IOServiceMatching pIOServiceMatching = NULL;
 static fn_IOServiceGetMatchingServices pIOServiceGetMatchingServices = NULL;
+static fn_IORegistryCreateIterator pIORegistryCreateIterator = NULL;
 static fn_IOIteratorNext pIOIteratorNext = NULL;
 static fn_IOObjectRelease pIOObjectRelease = NULL;
 static fn_IORegistryEntryCreateCFProperty pIORegistryEntryCreateCFProperty = NULL;
-static fn_IORegistryEntryFromPath pIORegistryEntryFromPath = NULL;
+static fn_IORegistryEntryCreateCFProperties pIORegistryEntryCreateCFProperties = NULL;
+static fn_IORegistryEntryGetPath pIORegistryEntryGetPath = NULL;
 
 static void *gIOKitHandle = NULL;
 
@@ -153,10 +166,12 @@ static BOOL ensureSymbols(void)
 
     pIOServiceMatching   = (fn_IOServiceMatching)heliumResolveSymbol("IOServiceMatching");
     pIOServiceGetMatchingServices = (fn_IOServiceGetMatchingServices)heliumResolveSymbol("IOServiceGetMatchingServices");
+    pIORegistryCreateIterator = (fn_IORegistryCreateIterator)heliumResolveSymbol("IORegistryCreateIterator");
     pIOIteratorNext      = (fn_IOIteratorNext)heliumResolveSymbol("IOIteratorNext");
     pIOObjectRelease     = (fn_IOObjectRelease)heliumResolveSymbol("IOObjectRelease");
     pIORegistryEntryCreateCFProperty = (fn_IORegistryEntryCreateCFProperty)heliumResolveSymbol("IORegistryEntryCreateCFProperty");
-    pIORegistryEntryFromPath = (fn_IORegistryEntryFromPath)heliumResolveSymbol("IORegistryEntryFromPath");
+    pIORegistryEntryCreateCFProperties = (fn_IORegistryEntryCreateCFProperties)heliumResolveSymbol("IORegistryEntryCreateCFProperties");
+    pIORegistryEntryGetPath = (fn_IORegistryEntryGetPath)heliumResolveSymbol("IORegistryEntryGetPath");
 
     gSymbolsOK = (pCopyChannelsInGroup && pCreateSubscription && pCreateSamples &&
                   pCreateSamplesDelta && pChannelGetChannelName && pStateGetCount &&
@@ -165,11 +180,43 @@ static BOOL ensureSymbols(void)
 }
 
 // ---------------------------------------------------------------------------
+// Channel-set helpers
+// ---------------------------------------------------------------------------
+
+// The dictionary IOReport hands back is {QueryOpts, IOReportChannels}; the actual
+// channel dictionaries live in that array. Counting the outer dictionary's keys
+// (always 2) therefore says nothing — this is the count that matters.
+static CFArrayRef channelArrayOf(CFDictionaryRef channelSet)
+{
+    if (!channelSet) return NULL;
+    CFTypeRef arr = CFDictionaryGetValue(channelSet, CFSTR("IOReportChannels"));
+    if (!arr || CFGetTypeID(arr) != CFArrayGetTypeID()) return NULL;
+    return (CFArrayRef)arr;
+}
+
+static CFIndex channelCountOf(CFDictionaryRef channelSet)
+{
+    CFArrayRef arr = channelArrayOf(channelSet);
+    return arr ? CFArrayGetCount(arr) : 0;
+}
+
+static NSString *channelGroupKey(CFDictionaryRef channel)
+{
+    CFStringRef g = pChannelGetGroup ? pChannelGetGroup(channel) : NULL;
+    CFStringRef s = pChannelGetSubGroup ? pChannelGetSubGroup(channel) : NULL;
+    return [NSString stringWithFormat:@"%@ | %@",
+            g ? (__bridge NSString *)g : @"?",
+            s ? (__bridge NSString *)s : @"?"];
+}
+
+// ---------------------------------------------------------------------------
 // DVFS frequency table
 // ---------------------------------------------------------------------------
 
 // Candidate keys, most-likely first. macOS measured values: 1-sram = E cluster,
-// 5-sram = P cluster. iOS/A-series keys are unverified — we try the whole family.
+// 5-sram = P cluster. iOS keys are unverified — the whole family is tried, and the
+// device tree is then searched for any property whose name contains
+// "voltage-states".
 static NSArray<NSString *> *const kPClusterKeys = @[ @"voltage-states5-sram",
                                                      @"voltage-states5",
                                                      @"voltage-states2-sram",
@@ -177,31 +224,6 @@ static NSArray<NSString *> *const kPClusterKeys = @[ @"voltage-states5-sram",
 static NSArray<NSString *> *const kEClusterKeys = @[ @"voltage-states1-sram",
                                                      @"voltage-states1",
                                                      @"voltage-states0-sram" ];
-
-/// Reads a raw property from the first matching IORegistry node.
-static CFTypeRef copyRegistryPropertyForService(const char *serviceName, CFStringRef key)
-{
-    if (!pIOServiceMatching || !pIOServiceGetMatchingServices ||
-        !pIOIteratorNext || !pIOObjectRelease || !pIORegistryEntryCreateCFProperty) {
-        return NULL;
-    }
-
-    CFMutableDictionaryRef match = pIOServiceMatching(serviceName);
-    if (!match) return NULL;
-
-    io_iterator_t iter = 0;
-    if (pIOServiceGetMatchingServices(0, match, &iter) != 0 || !iter) {
-        return NULL;
-    }
-
-    io_object_t entry = pIOIteratorNext(iter);
-    pIOObjectRelease(iter);
-    if (!entry) return NULL;
-
-    CFTypeRef value = pIORegistryEntryCreateCFProperty(entry, key, kCFAllocatorDefault, 0);
-    pIOObjectRelease(entry);
-    return value;
-}
 
 /// Parses a voltage-states blob (array of UInt32 pairs: freqHz, voltage) into an
 /// ascending array of MHz. Returns nil when the blob is missing or malformed.
@@ -226,36 +248,107 @@ static NSArray<NSNumber *> *parseVoltageStates(CFTypeRef blob)
     return out.count > 0 ? out : nil;
 }
 
-/// Looks for a voltage-states table under AppleARMIODevice (macOS) and, failing
-/// that, under the device-tree arm-io node (the iOS shape we have not verified).
+static NSString *registryPathOf(io_registry_entry_t entry)
+{
+    if (!pIORegistryEntryGetPath) return @"?";
+    char path[512] = { 0 };
+    if (pIORegistryEntryGetPath(entry, kDeviceTreePlane, path) != 0) return @"?";
+    return [NSString stringWithUTF8String:path] ?: @"?";
+}
+
+/// Walks the whole device tree looking for a property whose name contains
+/// "voltage-states". Returns the first parseable table and records where it came
+/// from, so the next build can look there directly.
+static NSArray<NSNumber *> *searchDeviceTreeForVoltageStates(NSString **pathOut, NSString **keyOut)
+{
+    if (!pIORegistryCreateIterator || !pIOIteratorNext || !pIOObjectRelease ||
+        !pIORegistryEntryCreateCFProperties) {
+        return nil;
+    }
+
+    io_iterator_t iter = 0;
+    // 1 == kIORegistryIterateRecursively
+    if (pIORegistryCreateIterator(0, kDeviceTreePlane, 1, &iter) != 0 || !iter) {
+        return nil;
+    }
+
+    NSArray<NSNumber *> *result = nil;
+    io_object_t entry = 0;
+    int visited = 0;
+
+    while ((entry = pIOIteratorNext(iter))) {
+        visited++;
+        if (visited > 4000) { pIOObjectRelease(entry); break; }
+
+        CFMutableDictionaryRef props = NULL;
+        if (pIORegistryEntryCreateCFProperties(entry, &props, kCFAllocatorDefault, 0) == 0 && props) {
+            CFIndex n = CFDictionaryGetCount(props);
+            if (n > 0) {
+                const void **keys = (const void **)malloc(sizeof(void *) * (size_t)n);
+                const void **vals = (const void **)malloc(sizeof(void *) * (size_t)n);
+                if (keys && vals) {
+                    CFDictionaryGetKeysAndValues(props, keys, vals);
+                    for (CFIndex i = 0; i < n; i++) {
+                        CFTypeRef k = keys[i];
+                        if (!k || CFGetTypeID(k) != CFStringGetTypeID()) continue;
+                        NSString *keyName = (__bridge NSString *)k;
+                        if ([keyName rangeOfString:@"voltage-states"].location == NSNotFound) continue;
+
+                        NSArray<NSNumber *> *parsed = parseVoltageStates(vals[i]);
+                        if (parsed && !result) {
+                            result = parsed;
+                            if (pathOut) *pathOut = registryPathOf(entry);
+                            if (keyOut) *keyOut = keyName;
+                        }
+                    }
+                }
+                if (keys) free(keys);
+                if (vals) free(vals);
+            }
+            CFRelease(props);
+        }
+        pIOObjectRelease(entry);
+        if (result) break;
+    }
+    pIOObjectRelease(iter);
+    return result;
+}
+
+/// Looks in the two places a table can live: a service property (macOS shape) and
+/// the device tree (the iOS shape we are now searching for).
 static NSArray<NSNumber *> *copyFrequenciesForKeys(NSArray<NSString *> *keys, NSString **foundKeyOut)
 {
-    for (NSString *key in keys) {
-        CFStringRef cfKey = (__bridge CFStringRef)key;
+    if (pIOServiceMatching && pIOServiceGetMatchingServices && pIOIteratorNext &&
+        pIOObjectRelease && pIORegistryEntryCreateCFProperty) {
+        for (NSString *key in keys) {
+            CFMutableDictionaryRef match = pIOServiceMatching("AppleARMIODevice");
+            if (!match) break;
+            io_iterator_t iter = 0;
+            if (pIOServiceGetMatchingServices(0, match, &iter) != 0 || !iter) continue;
 
-        CFTypeRef blob = copyRegistryPropertyForService("AppleARMIODevice", cfKey);
-        NSArray<NSNumber *> *freqs = parseVoltageStates(blob);
-        if (blob) CFRelease(blob);
-        if (freqs) {
-            if (foundKeyOut) *foundKeyOut = key;
-            return freqs;
-        }
+            io_object_t entry = pIOIteratorNext(iter);
+            pIOObjectRelease(iter);
+            if (!entry) continue;
 
-        if (pIORegistryEntryFromPath && pIORegistryEntryCreateCFProperty) {
-            io_registry_entry_t node = pIORegistryEntryFromPath(0, CFSTR("IODeviceTree:/arm-io"));
-            if (node) {
-                CFTypeRef treeBlob = pIORegistryEntryCreateCFProperty(node, cfKey, kCFAllocatorDefault, 0);
-                if (pIOObjectRelease) pIOObjectRelease(node);
-                NSArray<NSNumber *> *treeFreqs = parseVoltageStates(treeBlob);
-                if (treeBlob) CFRelease(treeBlob);
-                if (treeFreqs) {
-                    if (foundKeyOut) *foundKeyOut = [key stringByAppendingString:@" (device tree)"];
-                    return treeFreqs;
-                }
+            CFTypeRef blob = pIORegistryEntryCreateCFProperty(entry, (__bridge CFStringRef)key,
+                                                             kCFAllocatorDefault, 0);
+            pIOObjectRelease(entry);
+            NSArray<NSNumber *> *freqs = parseVoltageStates(blob);
+            if (blob) CFRelease(blob);
+            if (freqs) {
+                if (foundKeyOut) *foundKeyOut = [key stringByAppendingString:@" (AppleARMIODevice)"];
+                return freqs;
             }
         }
     }
-    return nil;
+
+    NSString *path = nil;
+    NSString *key = nil;
+    NSArray<NSNumber *> *found = searchDeviceTreeForVoltageStates(&path, &key);
+    if (found && foundKeyOut) {
+        *foundKeyOut = [NSString stringWithFormat:@"%@ @ %@", key ?: @"?", path ?: @"?"];
+    }
+    return found;
 }
 
 // Cached once: the DVFS table is fixed hardware data.
@@ -272,52 +365,130 @@ static void ensureFreqTables(void)
 }
 
 // ---------------------------------------------------------------------------
-// Cached subscription
+// Subscription: discover the group instead of assuming its name
 // ---------------------------------------------------------------------------
 
 static BOOL gSubscriptionTried = NO;
 static BOOL gSubscriptionOK = NO;
 static IORepSubRef gSubscription = NULL;
 static CFMutableDictionaryRef gSubscribedChannels = NULL;
+static NSString *gActiveGroupDescription = nil;
+
+/// Tries to subscribe to one channel set.
+static BOOL trySubscribe(CFStringRef group, CFStringRef subgroup,
+                         IORepSubRef *subOut, CFMutableDictionaryRef *channelsOut)
+{
+    if (!pCopyChannelsInGroup || !pCreateSubscription) return NO;
+
+    CFMutableDictionaryRef channels = pCopyChannelsInGroup(group, subgroup, 0, 0, 0);
+    if (!channels) return NO;
+
+    // A group that does not exist still yields a dictionary — but with an empty
+    // IOReportChannels array. That, not the outer key count, is the real test.
+    if (channelCountOf(channels) == 0) {
+        CFRelease(channels);
+        return NO;
+    }
+
+    CFMutableDictionaryRef subbed = NULL;
+    IORepSubRef sub = pCreateSubscription(NULL, channels, &subbed, 0, NULL);
+    if (!sub) {
+        CFRelease(channels);
+        if (subbed) CFRelease(subbed);
+        return NO;
+    }
+
+    CFMutableDictionaryRef target = subbed ? subbed : channels;
+    if (target != channels) CFRelease(channels);
+
+    *subOut = sub;
+    *channelsOut = target;
+    return YES;
+}
+
+/// Every group/subgroup pair IOReport exposes, derived from the channels
+/// themselves (the only place the real names live).
+static NSArray<NSString *> *allGroupKeys(void)
+{
+    NSMutableSet<NSString *> *keys = [NSMutableSet set];
+    if (!pCopyAllChannels) return @[];
+
+    CFMutableDictionaryRef all = pCopyAllChannels(0, 0);
+    if (!all) return @[];
+    CFArrayRef arr = channelArrayOf(all);
+    if (arr) {
+        CFIndex n = CFArrayGetCount(arr);
+        for (CFIndex i = 0; i < n; i++) {
+            CFDictionaryRef ch = (CFDictionaryRef)CFArrayGetValueAtIndex(arr, i);
+            if (ch && CFGetTypeID(ch) == CFDictionaryGetTypeID()) {
+                [keys addObject:channelGroupKey(ch)];
+            }
+        }
+    }
+    CFRelease(all);
+    return [[keys allObjects] sortedArrayUsingSelector:@selector(compare:)];
+}
+
+static BOOL trySubscribeGroupKey(NSString *key)
+{
+    NSArray<NSString *> *parts = [key componentsSeparatedByString:@" | "];
+    if (parts.count != 2) return NO;
+
+    CFStringRef subgroup = [parts[1] isEqualToString:@"?"] ? NULL : (__bridge CFStringRef)parts[1];
+    IORepSubRef sub = NULL;
+    CFMutableDictionaryRef channels = NULL;
+    if (!trySubscribe((__bridge CFStringRef)parts[0], subgroup, &sub, &channels)) return NO;
+
+    gSubscription = sub;
+    gSubscribedChannels = channels;
+    gActiveGroupDescription = [NSString stringWithFormat:@"%@ (discovered)", key];
+    gSubscriptionOK = YES;
+    return YES;
+}
 
 static BOOL ensureFreqSubscription(void)
 {
     if (gSubscriptionTried) return gSubscriptionOK;
     gSubscriptionTried = YES;
 
-    // Group/subgroup candidates. macOS measured "CPU Stats" +
-    // "CPU Complex Performance States"; the others are cheap alternatives.
+    // 1. Known candidates (the macOS-measured names, plus their neighbours).
     NSArray<NSArray<NSString *> *> *candidates = @[
         @[ @"CPU Stats", @"CPU Complex Performance States" ],
         @[ @"CPU Stats", @"CPU Core Performance States" ],
         @[ @"CPU Stats", @"" ],
     ];
-
     for (NSArray<NSString *> *candidate in candidates) {
         CFStringRef group = (__bridge CFStringRef)candidate[0];
         CFStringRef subgroup = candidate[1].length ? (__bridge CFStringRef)candidate[1] : NULL;
+        IORepSubRef sub = NULL;
+        CFMutableDictionaryRef channels = NULL;
+        if (trySubscribe(group, subgroup, &sub, &channels)) {
+            gSubscription = sub;
+            gSubscribedChannels = channels;
+            gActiveGroupDescription = [NSString stringWithFormat:@"%@ / %@",
+                                       candidate[0], candidate[1].length ? candidate[1] : @"(all)"];
+            gSubscriptionOK = YES;
+            return YES;
+        }
+    }
 
-        CFMutableDictionaryRef channels = pCopyChannelsInGroup(group, subgroup, 0, 0, 0);
-        if (!channels) continue;
-        if (CFDictionaryGetCount(channels) == 0) { CFRelease(channels); continue; }
+    // 2. Discovery: walk every group IOReport knows and subscribe to the first one
+    //    that plausibly carries per-cluster clock residency. This is what makes the
+    //    path work on iOS even though the macOS name did not.
+    for (NSString *key in allGroupKeys()) {
+        NSArray<NSString *> *parts = [key componentsSeparatedByString:@" | "];
+        if (parts.count != 2) continue;
 
-        CFMutableDictionaryRef subbed = NULL;
-        IORepSubRef sub = pCreateSubscription(NULL, channels, &subbed, 0, NULL);
-        if (!sub) {
-            CFRelease(channels);
-            if (subbed) CFRelease(subbed);
+        NSString *upper = parts[0].uppercaseString;
+        if ([upper rangeOfString:@"CPU"].location == NSNotFound &&
+            [upper rangeOfString:@"PMP"].location == NSNotFound &&
+            [upper rangeOfString:@"PERF"].location == NSNotFound &&
+            [upper rangeOfString:@"CLOCK"].location == NSNotFound) {
             continue;
         }
-
-        // Only the channels actually subscribed to can be sampled.
-        CFMutableDictionaryRef target = subbed ? subbed : channels;
-        if (target != channels) CFRelease(channels);
-
-        gSubscription = sub;
-        gSubscribedChannels = target;
-        gSubscriptionOK = YES;
-        return YES;
+        if (trySubscribeGroupKey(key)) return YES;
     }
+
     return NO;
 }
 
@@ -448,9 +619,10 @@ NSString *helium_real_cpu_frequency_diagnosis(void)
             pCopyChannelsInGroup != NULL, pCreateSubscription != NULL, pCreateSamples != NULL];
         [out appendFormat:@"  CreateSamplesDelta=%d StateGetCount=%d StateGetResidency=%d\n",
             pCreateSamplesDelta != NULL, pStateGetCount != NULL, pStateGetResidency != NULL];
-        [out appendFormat:@"  IOKit: matching=%d createCFProperty=%d fromPath=%d\n",
+        [out appendFormat:@"  IOKit: matching=%d createCFProperty=%d createCFProperties=%d iterator=%d path=%d\n",
             pIOServiceMatching != NULL, pIORegistryEntryCreateCFProperty != NULL,
-            pIORegistryEntryFromPath != NULL];
+            pIORegistryEntryCreateCFProperties != NULL, pIORegistryCreateIterator != NULL,
+            pIORegistryEntryGetPath != NULL];
 
         NSString *pKey = nil;
         NSString *eKey = nil;
@@ -462,83 +634,63 @@ NSString *helium_real_cpu_frequency_diagnosis(void)
         if (!ok) {
             [out appendString:@"\nStopping: IOReport symbols unavailable.\n"];
         } else {
-            // Enumerate every channel group IOReport exposes. If iOS names the group
-            // something other than "CPU Stats", this is where it shows up instead of
-            // the path silently degrading to the busy-loop probe.
-            if (pCopyAllChannels) {
-                CFMutableDictionaryRef all = pCopyAllChannels(0, 0);
-                if (all) {
-                    CFIndex count = CFDictionaryGetCount(all);
-                    [out appendFormat:@"\nAll-channels dictionary: %ld entries\n", (long)count];
-                    if (count > 0) {
-                        const void **keys = (const void **)malloc(sizeof(void *) * (size_t)count);
-                        const void **vals = (const void **)malloc(sizeof(void *) * (size_t)count);
-                        if (keys && vals) {
-                            CFDictionaryGetKeysAndValues(all, keys, vals);
-                            for (CFIndex i = 0; i < count; i++) {
-                                CFTypeRef k = keys[i];
-                                if (k && CFGetTypeID(k) == CFStringGetTypeID()) {
-                                    [out appendFormat:@"   group: %@\n", (__bridge NSString *)k];
-                                }
-                            }
-                        }
-                        if (keys) free(keys);
-                        if (vals) free(vals);
-                    }
-                    CFRelease(all);
-                } else {
-                    [out appendString:@"\nIOReportCopyAllChannels returned NULL\n"];
+            // 1. Every group/subgroup IOReport actually exposes, read off the
+            //    channels themselves (the outer dictionary's keys are not groups).
+            [out appendString:@"\nGroups IOReport exposes (group | subgroup):\n"];
+            NSArray<NSString *> *keys = allGroupKeys();
+            if (keys.count == 0) {
+                [out appendString:@"   (none — IOReportCopyAllChannels returned nothing usable)\n"];
+            } else {
+                for (NSString *key in keys) {
+                    [out appendFormat:@"   %@\n", key];
                 }
             }
 
-            [out appendString:@"\nEnumerating candidate CPU Stats subscriptions:\n"];
-            NSArray<NSArray<NSString *> *> *candidates = @[
-                @[ @"CPU Stats", @"CPU Complex Performance States" ],
-                @[ @"CPU Stats", @"CPU Core Performance States" ],
-                @[ @"CPU Stats", @"" ],
-            ];
-            for (NSArray<NSString *> *candidate in candidates) {
-                CFStringRef group = (__bridge CFStringRef)candidate[0];
-                CFStringRef subgroup = candidate[1].length ? (__bridge CFStringRef)candidate[1] : NULL;
+            // 2. Which of them can actually be subscribed to, and how many channels
+            //    each carries (the number the first build got wrong).
+            [out appendString:@"\nSubscription attempts:\n"];
+            for (NSString *key in keys) {
+                NSArray<NSString *> *parts = [key componentsSeparatedByString:@" | "];
+                if (parts.count != 2) continue;
 
-                CFMutableDictionaryRef channels = pCopyChannelsInGroup(group, subgroup, 0, 0, 0);
-                [out appendFormat:@"\n-- %@ / %@ : channels=%s\n",
-                    candidate[0], candidate[1].length ? candidate[1] : @"(all)",
-                    channels ? "yes" : "NO"];
-                if (!channels) continue;
+                CFStringRef subgroup = [parts[1] isEqualToString:@"?"]
+                    ? NULL : (__bridge CFStringRef)parts[1];
+                CFMutableDictionaryRef probe = pCopyChannelsInGroup(
+                    (__bridge CFStringRef)parts[0], subgroup, 0, 0, 0);
+                CFIndex count = channelCountOf(probe);
+                if (probe) CFRelease(probe);
 
-                CFMutableDictionaryRef subbed = NULL;
-                IORepSubRef sub = pCreateSubscription(NULL, channels, &subbed, 0, NULL);
-                [out appendFormat:@"   subscription: %s\n", sub ? "ok" : "REFUSED"];
-                if (sub) {
-                    CFMutableDictionaryRef target = subbed ? subbed : channels;
-                    CFDictionaryRef s = pCreateSamples(sub, target, NULL);
-                    NSArray *list = copyChannelsArrayFromSample(s);
-                    [out appendFormat:@"   channels in sample: %lu\n", (unsigned long)list.count];
-                    for (id item in list) {
-                        if (![item isKindOfClass:[NSDictionary class]]) continue;
-                        CFDictionaryRef metric = (__bridge CFDictionaryRef)item;
-                        CFStringRef cfName = pChannelGetChannelName ? pChannelGetChannelName(metric) : NULL;
-                        CFStringRef cfGroup = pChannelGetGroup ? pChannelGetGroup(metric) : NULL;
-                        CFStringRef cfSub = pChannelGetSubGroup ? pChannelGetSubGroup(metric) : NULL;
-                        NSString *name = cfName ? (__bridge NSString *)cfName : @"?";
-                        NSString *grp = cfGroup ? (__bridge NSString *)cfGroup : @"?";
-                        NSString *sb = cfSub ? (__bridge NSString *)cfSub : @"?";
-
-                        int states = pStateGetCount ? pStateGetCount(metric) : 0;
-                        NSMutableArray<NSString *> *stateNames = [NSMutableArray array];
-                        for (int i = 0; i < states && i < 24; i++) {
-                            CFStringRef sn = pStateGetNameForIndex ? pStateGetNameForIndex(metric, i) : NULL;
-                            if (sn) [stateNames addObject:(__bridge NSString *)sn];
-                        }
-                        [out appendFormat:@"     [%@|%@] %@  states=%d %@\n",
-                            grp, sb, name, states,
-                            [stateNames componentsJoinedByString:@","]];
-                    }
-                    if (s) CFRelease(s);
-                }
+                IORepSubRef sub = NULL;
+                CFMutableDictionaryRef channels = NULL;
+                BOOL subOK = trySubscribe((__bridge CFStringRef)parts[0], subgroup, &sub, &channels);
+                [out appendFormat:@"   %@ : channels=%ld subscribe=%s\n",
+                    key, (long)count, subOK ? "ok" : "REFUSED"];
                 // The subscription itself is deliberately not released (see header).
-                CFRelease(channels);
+            }
+
+            // 3. The channel/state layout of whichever group we ended up using.
+            if (ensureFreqSubscription()) {
+                [out appendFormat:@"\nActive group: %@\n", gActiveGroupDescription ?: @"?"];
+                CFDictionaryRef s = pCreateSamples(gSubscription, gSubscribedChannels, NULL);
+                NSArray *list = copyChannelsArrayFromSample(s);
+                [out appendFormat:@"   channels: %lu\n", (unsigned long)list.count];
+                for (id item in list) {
+                    if (![item isKindOfClass:[NSDictionary class]]) continue;
+                    CFDictionaryRef metric = (__bridge CFDictionaryRef)item;
+                    CFStringRef cfName = pChannelGetChannelName ? pChannelGetChannelName(metric) : NULL;
+                    NSString *name = cfName ? (__bridge NSString *)cfName : @"?";
+                    int states = pStateGetCount ? pStateGetCount(metric) : 0;
+                    NSMutableArray<NSString *> *stateNames = [NSMutableArray array];
+                    for (int i = 0; i < states && i < 24; i++) {
+                        CFStringRef sn = pStateGetNameForIndex ? pStateGetNameForIndex(metric, i) : NULL;
+                        if (sn) [stateNames addObject:(__bridge NSString *)sn];
+                    }
+                    [out appendFormat:@"     %@  states=%d %@\n",
+                        name, states, [stateNames componentsJoinedByString:@","]];
+                }
+                if (s) CFRelease(s);
+            } else {
+                [out appendString:@"\nNo group could be subscribed to — the real-frequency path is unavailable.\n"];
             }
         }
     } @catch (NSException *e) {
