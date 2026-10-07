@@ -121,6 +121,16 @@
 	<true/>
 	<key>com.apple.private.sysdiagnose</key>
 	<true/>
+	<!--
+	  IOReport 读真实 CPU 频率 / 温度需要此私有权限。iOS 上 IOReport 订阅
+	  不仅要求调用进程是 root（HUD 守护进程满足），还要求该 entitlement，
+	  否则每个 group 都 subscribe=REFUSED（见 HeliumCPUFreqDiag(3).txt）。
+	  TrollStore 放行任意私有权限，签名带上即可由 HUD(root) 订阅 CPU Stats，
+	  读出真实 DVFS 驻留算实时频率；CPU 温度部件也可能从 ??ºC 变可用。
+	  这是 wildcard，允许所有 IOReport 组（SiliconScope / macmon 同款）。
+	-->
+	<key>com.apple.private.ioreport.allow</key>
+	<true/>
 	<key>com.apple.private.ubiquity-additional-kvstore-identifiers</key>
 	<array>
 		<string>com.apple.AssistiveTouch</string>

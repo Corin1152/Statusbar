@@ -99,36 +99,36 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: statusbar-${{ github.run_number }}
-          name: Statusbar 0.14 (build ${{ github.run_number }})
+          name: Statusbar 0.15 (build ${{ github.run_number }})
           body: |
-            基于 Helium 改版。应用名改为 Statusbar，版本从 0.01 起（本次 0.14）。
+            基于 Helium 改版。应用名改为 Statusbar，版本从 0.01 起（本次 0.15）。
 
             界面：只有「首页 / 自定义」两页，首页右上角直接显示版本号（无齿轮/设置入口）。
             部件：原有 9 个 + CPU温度 / CPU占用 / CPU频率 / 蜂窝信号（RSRP）。
 
-            本次改动（让 CPU 频率步进与 SysProbe 对齐到 1 秒）：
-              · **CPU 频率部件改为渲染共享文件里的频率**，而不是自己的 3 秒忙循环探针。
-                共享文件由 CPUMetricsPublisher 每 1 秒写一次：当 HUD 以 root 守护进程
-                运行时，频率取自 IOReport 的真实 DVFS 驻留（当前实际档位）；
-                主 App(mobile) 无 root，则由 HUD 的读数兜底。SysProbe 读的就是同一个
-                文件，于是两边频率步进都是 1 秒、数值完全一致。
-              · 原来的忙循环探针降级为「冷启动兜底」——只在共享文件缺失或过期
-                （启动后前 0.5 秒、或发布器未运行）时才用，不再每个红染周期都跑，
-                因此状态栏读数不再为了保持高频而持续顶着性能核。
-              · 频率读数是「当前 DVFS 档位（IOReport 真实驻留）」，不是探针测出的
-                「可达峰值」。两者数值可能不同：IOReport 更贴近此刻真实频率，属预期。
+            本次改动（让 CPU 频率真正读实时 DVFS 档位）：
+              · 0.14 已让频率部件渲染共享文件（1Hz），与 SysProbe 步进/数值对齐。
+                但真机诊断 `HeliumCPUFreqDiag(3).txt` 显示：即便 HUD 是 root，全部
+                IOReport 组都 `subscribe=REFUSED` —— 单有 root 不够，还需
+                `com.apple.private.ioreport.allow` 私有权限（CPU 温度通道已正常，
+                被拒的是频率用的 `CPU Stats` 组）。
+              · 本版在 `ent.plist` 加入 `com.apple.private.ioreport.allow`（wildcard，
+                SiliconScope / macmon 同款）。TrollStore 放行任意私有权限，签名带上后
+                HUD(root) 即可订阅 `CPU Stats`、读出真实驻留算实时频率——
+                即此刻实际 DVFS 档位（负载高升、空闲降），不再是忙循环测的「可达峰值」。
+              · CPU 频率与占用仍写入共享文件，SysProbe 读同一文件 → 两边 1 秒步进、同数值
+                （HUD root 时均为 IOReport 真实档位）。
 
             安装：用 TrollStore / 巨魔安装 Statusbar.ipa。
-            ⚠️ 想看「真实订阅结果」：安装后**重启一次设备**，HUD 守护进程加载新二进制，
-               打开 Statusbar，HUD(root) 写出 `subscribe=ok` 的真实诊断。
-               不重启也能看：打开 App 即得到信息充分的 mobile 版诊断（表 + 组列表）。
+            ⚠️ 装后**重启一次设备**，让 HUD 守护进程加载含新权限的新二进制；打开 Statusbar，
+               HUD(root) 应能写出 `subscribe=ok` 的真实诊断，频率部件显示实时步进。
 
             使用：Statusbar → Customize → 添加部件。
 
             说明：
-              · 温度显示 ??ºC 表示该机型读不到 CPU die 温度通道，属预期降级。
-              · 占用率显示 -- 表示还没采到样；频率显示 -- 表示共享文件暂无新鲜读数
-                （启动后前 0.5 秒），随后即为 1 秒步进的 IOReport 频率。
+              · 温度此前已正常（用户确认），其读数来源不依赖本权限；本版权限主要解锁频率。
+              · 占用率走 host_processor_info，与权限无关，本就正常。
+              · 频率显示 -- 表示共享文件暂无新鲜读数（启动后前 0.5 秒），随后为 1 秒步进。
               · 蜂窝信号显示 -- 时，进该部件的设置页看「状态」一行：
                 「不可用」说明 CommCenter 权限没生效，不是没有信号。
 
