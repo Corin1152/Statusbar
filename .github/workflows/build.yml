@@ -99,18 +99,20 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: statusbar-${{ github.run_number }}
-          name: Statusbar 0.10 (build ${{ github.run_number }})
+          name: Statusbar 0.11 (build ${{ github.run_number }})
           body: |
-            基于 Helium 改版。应用名改为 Statusbar，版本从 0.01 起（本次 0.10）。
+            基于 Helium 改版。应用名改为 Statusbar，版本从 0.01 起（本次 0.11）。
 
             界面：只有「首页 / 自定义」两页，设置入口在首页右上角的齿轮。
             部件：原有 9 个 + CPU温度 / CPU占用 / CPU频率 / 蜂窝信号（RSRP）。
 
             本次改动：
+              · 修复「装了新版但诊断文件/共享指标不更新」：发布器原来只挂在 HUD
+                进程（LaunchDaemon 用 `Helium -hud` 启动，KeepAlive）的启动路径上，
+                而 HUD 进程在 TrollStore 覆盖安装后仍跑旧二进制（要重启设备才换）。
+                现在**主 App 启动时也启动发布器** —— 打开一次 App 即生效，无需重启。
               · 首页右上角不再有齿轮按钮，改为直接显示版本号（位置不变）。
                 原来的「关于」页（版本号 + 致谢 + GPL 说明）整页移除。
-              · 上一版起：CPU 频率改用 IOReport 真实档位（自动发现 group），
-                并每秒把占用/频率发布到共享文件供 SysProbe 显示同一份数值。
 
             安装：用 TrollStore / 巨魔安装 Statusbar.ipa。
             使用：Statusbar → Customize → 添加部件。
