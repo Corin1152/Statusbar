@@ -96,16 +96,29 @@
 #define PROBE_WARMUP_TARGET_NS (50ull * 1000000ull)
 #define PROBE_WARMUP_CHUNK 300000
 
-/// Measured rounds: ~2.5 ms each, six of them, best one wins.
+/// Measured rounds: ~0.5 ms each, twenty-four of them, fastest one wins.
 ///
-/// Six rounds rather than five, and a shorter round than before: the reported
-/// maximum is only as good as the cleanest round it saw, and a round only has to be
-/// long enough for the counter read to be negligible next to the loop (at ~2.5 ms,
-/// a couple of hundred cycles of overhead is under 0.01%). Shorter rounds mean more
-/// of them fit in the same budget, which raises the odds that at least one lands in
-/// a stretch where the scheduler left the thread alone.
-#define PROBE_MEASURE_ROUNDS 200000
-#define PROBE_MEASURE_ROUND_COUNT 6
+/// The window used to be 2.5 ms x 6. That was tuned for the *idle* case and it is
+/// the wrong shape for the *loaded* one, which is where the reading actually
+/// matters — a user who opens a game wants to see the clock climb, not to be told
+/// the CPU is still at its idle gear.
+///
+/// The reason is that the elapsed time here is wall-clock: a round that gets
+/// preempted mid-spin reports the preemption as if the loop had simply taken
+/// longer, so it comes out **low**. Under load the odds of a 2.5 ms window being
+/// interrupted are high, and six draws is not enough to be confident that one of
+/// them was clean — which is exactly why a fully loaded device still read ~2030
+/// instead of the top gear.
+///
+/// Shortening the window and multiplying the count fixes that directly: at ~0.5 ms
+/// a round is short enough that the scheduler usually leaves it alone, and 24 draws
+/// make it very unlikely that *all* of them get hit. The per-round overhead (the
+/// two `isb` + the counter reads, a couple hundred cycles) is still under 0.01% of
+/// a 0.5 ms round, so nothing is lost by cutting the window this small.
+///
+/// Total spin is unchanged: 24 x 0.5 ms is the same 12 ms the 6 x 2.5 ms used.
+#define PROBE_MEASURE_ROUNDS 40000
+#define PROBE_MEASURE_ROUND_COUNT 24
 
 /// Plausibility window, in MHz.
 ///
