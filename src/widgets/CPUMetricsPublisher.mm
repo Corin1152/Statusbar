@@ -29,8 +29,11 @@
 //      "usage_mode": 0,               // 0 = average (kept for future use)
 //      "writer": "helium" }
 //
-//  Two paths are written: /var/tmp is the primary, the Caches copy survives a
-//  reboot and covers setups where /var/tmp is not writable.
+//  Two paths are *tried*, in this order: /var/tmp is the primary, and the Caches copy
+//  is written only when the primary write fails — it covers the setups where /var/tmp
+//  is not usable, which is the only reason it exists. (Until 0.25 both were written
+//  unconditionally, which doubled the per-second file I/O to keep a fallback that
+//  nothing ever read.)
 //
 //  ## This file is the contract
 //
@@ -64,6 +67,7 @@
 
 #import <Foundation/Foundation.h>
 #import <dispatch/dispatch.h>
+#import <os/lock.h>   // os_unfair_lock — 保护下面的暂停状态
 #import <unistd.h>   // getuid — only the root HUD can read IOReport CPU frequency
 
 // Provided by WidgetManager.mm. These must be declared `extern "C"`: this file is
@@ -75,6 +79,36 @@ extern "C" uint64_t HeliumCPUFrequencyKHz(void);
 extern "C" void HeliumCPUFrequencyKick(void);
 
 static dispatch_source_t gPublisherTimer = NULL;
+static dispatch_queue_t gPublisherQueue = NULL;
+
+/// 暂停状态。三样都由 `gPublisherLock` 保护，而且**只能**在持锁时读写：
+///
+///   `gPublisherPaused`   期望状态（锁屏时为 YES）。可能在 timer 建起来之前就被设上
+///                        （HUD 起来时屏幕可能就是锁着的），所以它是独立的一份意图，
+///                        创建 timer 时再按它决定要不要 resume。
+///   `gPublisherRunning`  timer 当前是否已 resume。`dispatch_suspend` / `dispatch_resume`
+///                        必须严格配对，多一次就崩，所以用这个标志当唯一事实来源，
+///                        不要靠别的东西推断。
+static os_unfair_lock gPublisherLock = OS_UNFAIR_LOCK_INIT;
+static BOOL gPublisherPaused = NO;
+static BOOL gPublisherRunning = NO;
+
+/// 把 timer 的挂起状态对齐到 `gPublisherPaused`。必须在持锁时调用。
+static void applyPublisherPauseStateLocked(void)
+{
+    if (!gPublisherTimer) return;               // 还没建；建的时候会读 gPublisherPaused
+
+    // 「已挂起」⇔「未运行」，两者一致就无事可做。
+    if (gPublisherPaused == !gPublisherRunning) return;
+
+    if (gPublisherPaused) {
+        dispatch_suspend(gPublisherTimer);
+        gPublisherRunning = NO;
+    } else {
+        dispatch_resume(gPublisherTimer);
+        gPublisherRunning = YES;
+    }
+}
 
 static const NSTimeInterval kPublishIntervalSeconds = 1.0;
 
@@ -142,12 +176,29 @@ static void publishOnce(void)
         NSData *data = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
         if (!data) return;
 
-        for (NSString *path in sharedMetricPaths()) {
+        // 只写主路径；写失败了才写备用路径。
+        //
+        // 原来是无条件两个都写，于是稳态里每秒两次原子写（每次都是「写临时文件 + rename」），
+        // 而备用那份**没有任何人会读到** —— 读方（SysProbe 的主 App 与负一屏扩展）是按顺序
+        // 试路径的，先试 `/var/tmp`；扩展带 no-sandbox 与绝对路径例外，读得到
+        // （见 Support/TodayExtension.entitlements）。所以备用那份的全部意义就是
+        // 「覆盖 /var/tmp 不可写的情况」，而 `writeToFile:` 的返回值正好就是那个判据。
+        //
+        // 这不是契约的一部分：读方只关心「两个路径、按这个顺序试」，不关心它们各自被写的
+        // 频率。改这里不需要动 SysProbe。
+        NSArray<NSString *> *paths = sharedMetricPaths();
+        BOOL wrotePrimary = NO;
+        @try {
+            wrotePrimary = [data writeToFile:paths[0] atomically:YES];
+        } @catch (NSException *e) {
+            wrotePrimary = NO;
+        }
+        if (!wrotePrimary) {
             @try {
-                [data writeToFile:path atomically:YES];
+                [data writeToFile:paths[1] atomically:YES];
             } @catch (NSException *e) {
-                // A path that is not writable on this setup is not fatal — the other
-                // one still carries the value.
+                // 两个路径都写不了：这一拍没落盘。不致命 —— 读方会读到旧值，或者
+                // 因为超出新鲜度窗口而显示「—」。
             }
         }
     }
@@ -194,6 +245,39 @@ void helium_start_cpu_metrics_publisher(void)
         dispatch_source_set_event_handler(gPublisherTimer, ^{
             publishOnce();
         });
-        dispatch_resume(gPublisherTimer);
+
+        os_unfair_lock_lock(&gPublisherLock);
+        gPublisherQueue = queue;
+        // `dispatch_source_create` 出来就是挂起态，所以「不 resume」天然就是暂停。
+        // `gPublisherPaused` 可能在这次调用之前就被设上了（见头文件）。
+        if (gPublisherPaused) {
+            gPublisherRunning = NO;
+        } else {
+            dispatch_resume(gPublisherTimer);
+            gPublisherRunning = YES;
+        }
+        os_unfair_lock_unlock(&gPublisherLock);
+    });
+}
+
+void helium_set_cpu_metrics_publisher_paused(BOOL paused)
+{
+    dispatch_queue_t publishNow = NULL;
+
+    os_unfair_lock_lock(&gPublisherLock);
+    BOOL resuming = (gPublisherPaused && !paused);
+    gPublisherPaused = paused;
+    applyPublisherPauseStateLocked();
+    // 立刻补一拍得在同一个队列上排队，才保证「先 resume、再发布」的顺序。
+    if (resuming) publishNow = gPublisherQueue;
+    os_unfair_lock_unlock(&gPublisherLock);
+
+    if (!publishNow) return;
+
+    // 解锁时补这一拍，是为了消掉一个竞态：读方的新鲜度窗口是 5 秒，而锁屏期间文件是
+    // 停更的。不补的话，用户解锁后立刻划到负一屏，扩展可能正好读到一份刚过期（或即将
+    // 过期）的文件 —— 那会显示成「—」，而状态栏上明明有数。
+    dispatch_async(publishNow, ^{
+        publishOnce();
     });
 }

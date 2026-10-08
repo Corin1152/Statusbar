@@ -476,6 +476,15 @@ static const void *kHeliumLastAttributedTextKey = &kHeliumLastAttributedTextKey;
             continue;
         [[EZTimer shareInstance] pause:[NSString stringWithFormat:@"labelview%d", i]];
     }
+
+    // 发布器跟着一起停。
+    //
+    // 原来锁屏只停了渲染定时器，发布器照旧每秒跑一轮 —— 忙循环测频、算占用、写文件。
+    // 那些工作的**唯一**消费者是 SysProbe（HUD 自己的部件读的是进程内值），而锁屏时
+    // 负一屏不可能在屏幕上。所以这一整条链在锁屏期间是纯耗电。
+    //
+    // 解锁时 `resumeLoopTimer` 会把它恢复并立刻补一拍，见那里的注释。
+    helium_set_cpu_metrics_publisher_paused(YES);
 }
 
 - (void)resumeLoopTimer
@@ -487,6 +496,9 @@ static const void *kHeliumLastAttributedTextKey = &kHeliumLastAttributedTextKey;
             continue;
         [[EZTimer shareInstance] resume:[NSString stringWithFormat:@"labelview%d", i]];
     }
+
+    // 恢复发布器；它内部会立刻补一次发布，所以文件在解锁的那一刻就是新鲜的。
+    helium_set_cpu_metrics_publisher_paused(NO);
 }
 
 - (void)viewSafeAreaInsetsDidChange

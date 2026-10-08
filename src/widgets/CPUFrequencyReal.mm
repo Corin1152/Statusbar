@@ -592,6 +592,23 @@ uint64_t helium_real_cpu_frequency_mhz(void)
         CFDictionaryRef s1 = pCreateSamples(gSubscription, gSubscribedChannels, NULL);
         if (!s1) return 0;
 
+        // 两次采样之间隔 100 ms —— 有这段时间，DVFS 驻留计数器才有东西可差分。
+        //
+        // 这一行被怀疑过是「HUD 每秒白睡 100 ms」，**不是**，理由有两条，都在这个
+        // 函数里看得见：
+        //
+        //   1. 它在这条路径的**末尾**。上面 `ensureFreqSubscription()` 一旦失败就
+        //      `return 0`，而本机正是那样 —— 0.17 的自检结论是：权限
+        //      `com.apple.private.ioreport.allow` PRESENT，但按组订阅与整通道集订阅
+        //      **全部 REFUSED**。所以 HUD 每秒那次调用在第 587 行就返回了，根本走不到
+        //      这里。（这也解释了为什么 `CPUMetricsPublisher` 里那次调用是免费的：
+        //      `ensureSymbols` / `ensureFreqSubscription` 都是 `*Tried` 缓存过的一次性
+        //      探测。）
+        //   2. 真走到这里，说明订阅成功、DVFS 表也在，那么下面算出来的读数会被
+        //      `CPUMetricsPublisher` 用作 `freq_mhz` 并把 `freq_source` 置成
+        //      `"ioreport"` —— 是**用掉了**，不是丢弃。
+        //
+        // 换句话说：要么走不到，要么不白走。别为了「省这 100 ms」把它删掉。
         struct timespec ts = { 0, 100 * 1000 * 1000 };   // 100 ms window
         nanosleep(&ts, NULL);
 
