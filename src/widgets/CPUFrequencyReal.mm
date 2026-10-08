@@ -60,6 +60,8 @@
 #import <time.h>
 #import <unistd.h>   // getuid — IOReport subscription requires root
 
+#import "CPUFrequencyProbe.h"   // helium_measure_cpu_frequency_mhz — 0.17 self-check
+
 /// The device-tree plane name. Written as a literal because the SDK constant is
 /// not exported on iOS.
 static const char *const kDeviceTreePlane = "IODeviceTree";
@@ -613,6 +615,117 @@ uint64_t helium_real_cpu_frequency_mhz(void)
     return result;
 }
 
+// ---------------------------------------------------------------------------
+// 0.17 self-check helpers
+// ---------------------------------------------------------------------------
+
+// Report the entitlements THIS process actually carries, by asking
+// Security.framework about our own task. Resolved with dlopen/dlsym (same trick
+// as IOReport) so the Makefile does not need Security.framework added.
+//
+// Why this settles the IOReport question: if com.apple.private.ioreport.allow
+// shows PRESENT here yet every subscription below is still REFUSED, the
+// entitlement is genuinely present but insufficient — the kernel wants more than
+// the entitlement. If it shows "absent", the install/signing dropped it and that
+// is the whole problem.
+static void appendOwnEntitlements(NSMutableString *out)
+{
+    @try {
+        void *h = dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_LAZY);
+        if (!h) {
+            [out appendString:@"  Own entitlements: (Security.framework dlopen failed)\n"];
+            return;
+        }
+        typedef CFTypeRef (*fn_SecTaskCreateFromSelf)(CFAllocatorRef);
+        typedef CFTypeRef (*fn_SecTaskCopyValueForEntitlement)(CFTypeRef, CFStringRef, CFTypeRef *);
+        fn_SecTaskCreateFromSelf createSelf =
+            (fn_SecTaskCreateFromSelf)dlsym(h, "SecTaskCreateFromSelf");
+        fn_SecTaskCopyValueForEntitlement copyEnt =
+            (fn_SecTaskCopyValueForEntitlement)dlsym(h, "SecTaskCopyValueForEntitlement");
+        if (!createSelf || !copyEnt) {
+            [out appendString:@"  Own entitlements: (SecTask symbols missing)\n"];
+            return;
+        }
+        CFTypeRef task = createSelf(NULL);
+        if (!task) {
+            [out appendString:@"  Own entitlements: (SecTaskCreateFromSelf -> NULL)\n"];
+            return;
+        }
+        NSArray<NSString *> *keys = @[
+            @"com.apple.private.ioreport.allow",
+            @"com.apple.private.security.no-sandbox",
+            @"platform-application",
+            @"get-task-allow",
+            @"com.apple.private.skip-library-validation",
+            @"task_for_pid-allow",
+            @"com.apple.private.iokit.ioallow",
+        ];
+        [out appendString:@"  Own entitlements (this process):\n"];
+        for (NSString *k in keys) {
+            CFTypeRef v = copyEnt(task, (__bridge CFStringRef)k, NULL);
+            if (v) {
+                [out appendFormat:@"     %@ = PRESENT (%@)\n", k, (__bridge id)v];
+                CFRelease(v);
+            } else {
+                [out appendFormat:@"     %@ = absent\n", k];
+            }
+        }
+        CFRelease(task);
+    } @catch (NSException *e) {
+        [out appendFormat:@"  Own entitlements: failed (%@)\n", e.reason];
+    }
+}
+
+// The shared file the frequency widget actually renders. Shows whether the value
+// on screen is the probe's or a real IOReport reading.
+static void appendSharedFileCheck(NSMutableString *out)
+{
+    for (NSString *path in @[ @"/var/tmp/cpu_metrics.json",
+                              @"/var/mobile/Library/Caches/cpu_metrics.json" ]) {
+        NSData *d = [NSData dataWithContentsOfFile:path];
+        if (!d) { [out appendFormat:@"     %@ : (missing)\n", path]; continue; }
+        NSDictionary *j = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+        if (![j isKindOfClass:[NSDictionary class]]) {
+            [out appendFormat:@"     %@ : (unparseable)\n", path];
+            continue;
+        }
+        [out appendFormat:@"     %@ : freq_mhz=%@ freq_source=%@ writer=%@ ts=%@\n",
+            path, j[@"freq_mhz"], j[@"freq_source"], j[@"writer"], j[@"ts"]];
+    }
+}
+
+// Try subscribing to the WHOLE channel set (IOReportCopyAllChannels) — a
+// different code path from the per-group subscribe used elsewhere, and the one
+// the temperature widget's older implementation used. If this one succeeds while
+// per-group does not, the frequency reader can switch to it.
+static void appendWholeSetSubscribeCheck(NSMutableString *out)
+{
+    @try {
+        if (!ensureSymbols()) {
+            [out appendString:@"  Whole-set subscribe: (symbols missing)\n"];
+            return;
+        }
+        if (!pCopyAllChannels || !pCreateSubscription) {
+            [out appendString:@"  Whole-set subscribe: (functions missing)\n"];
+            return;
+        }
+        CFMutableDictionaryRef all = pCopyAllChannels(0, 0);
+        if (!all) {
+            [out appendString:@"  Whole-set subscribe: CopyAllChannels -> NULL\n"];
+            return;
+        }
+        CFIndex n = channelCountOf(all);
+        CFMutableDictionaryRef subbed = NULL;
+        IORepSubRef sub = pCreateSubscription(NULL, all, &subbed, 0, NULL);
+        [out appendFormat:@"  Whole-set subscribe (IOReportCopyAllChannels, %ld channels): %s\n",
+            (long)n, sub ? "ok" : "REFUSED"];
+        // Intentionally not released: a subscription has no documented release and
+        // CFRelease on one can take the HUD down (see header). This runs once.
+    } @catch (NSException *e) {
+        [out appendFormat:@"  Whole-set subscribe: failed (%@)\n", e.reason];
+    }
+}
+
 NSString *helium_real_cpu_frequency_diagnosis(void)
 {
     // Write a fresh report on every run, with one exception: a NON-ROOT process must
@@ -650,6 +763,20 @@ NSString *helium_real_cpu_frequency_diagnosis(void)
     [out appendString:@"IOReport access is gated by com.apple.private.ioreport.allow "
                    "(added in 0.15), not by uid; subscribing below in whichever process "
                    "this is.\n"];
+    [out appendString:@"\n"];
+
+    // ---- 0.17 self-check ----
+    [out appendString:@"Self-check:\n"];
+    [out appendFormat:@"  uid=%d gid=%d euid=%d\n", getuid(), getgid(), geteuid()];
+    appendOwnEntitlements(out);
+    [out appendString:@"  Busy-loop probe samples (each ~15-20 ms):\n"];
+    for (int i = 0; i < 5; i++) {
+        uint64_t m = helium_measure_cpu_frequency_mhz();
+        [out appendFormat:@"     sample %d: %llu MHz\n", i + 1, m];
+    }
+    [out appendString:@"  Shared file readings:\n"];
+    appendSharedFileCheck(out);
+    appendWholeSetSubscribeCheck(out);
     [out appendString:@"\n"];
 
     @try {

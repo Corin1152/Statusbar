@@ -99,39 +99,35 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: statusbar-${{ github.run_number }}
-          name: Statusbar 0.16 (build ${{ github.run_number }})
+          name: Statusbar 0.17 (build ${{ github.run_number }})
           body: |
-            基于 Helium 改版。应用名改为 Statusbar，版本从 0.01 起（本次 0.16）。
+            基于 Helium 改版。应用名改为 Statusbar，版本从 0.01 起（本次 0.17）。
 
             界面：只有「首页 / 自定义」两页，首页右上角直接显示版本号（无齿轮/设置入口）。
             部件：原有 9 个 + CPU温度 / CPU占用 / CPU频率 / 蜂窝信号（RSRP）。
 
-            本次改动（修复「诊断文件不更新」）：
-              · 0.13 为「防止主 App 覆盖 HUD 的真实报告」加了一道守卫：文件里已含
-                `process: root` 就原样返回、不重写。这是个 bug —— 0.14 的 HUD 写过一次后，
-                文件里就永远带着该字符串，之后**任何**进程（包括重启后的新 HUD）都被这道
-                守卫挡住，诊断文件从此永久冻结、再也不会更新。
-              · 本版改为：**root 进程永远重写**；非 root 进程仅在「已有成功订阅报告
-                (`subscribe=ok`)」时才跳过。于是打开 App 即可刷新诊断，同时不会把好报告
-                覆盖成差的。
-              · 0.15 已加 `com.apple.private.ioreport.allow`，而 IOReport 订阅的门槛是
-                **该权限、不是 uid**（SiliconScope/macmon 都是普通 App 带权限即可）。故诊断
-                改为**无论 root 还是 mobile 都真的去订阅**并如实上报（不再一律标
-                REFUSED(non-root)）。
-              · 诊断的订阅尝试**限定到 CPU 相关组**（CPU/PMP/PERF/CLOCK/DVFS）：订阅在本 OS
-                上无法释放，若对全部上千个组都建订阅会残留大量活订阅，故只对可能有频率
-                驻留的组建。
+            本次改动（自检版：把「频率到底能不能读真实值」钉死）：
+              · 0.16 诊断已证明：即便 HUD 是 root、`com.apple.private.ioreport.allow` 也确实在
+                二进制签名里，IOReport 全部订阅仍 `REFUSED`；温度部件是靠 **HID 传感器兜底**
+                才正常。
+              · 本版在诊断开头加「Self-check」段，直接给出四件事：
+                  1) 本进程自身的 entitlements（用 Security.framework 的 SecTask 读回，
+                     确认 `com.apple.private.ioreport.allow` 等对进程是否真的生效）；
+                  2) 忙循环探针的 5 次原始采样值（看清频率显示的到底是什么）；
+                  3) 共享文件当前读数（freq_mhz / freq_source / writer）；
+                  4) 另试一次「整通道集」订阅（`IOReportCopyAllChannels`，与按组订阅是不同
+                     代码路径，可能结果不同）。
+              · 频率行为不变：仍来自忙循环探针，随负载/温度在 DVFS 档位间跳动（不是固定峰值，
+                但也不是 IOReport 的按驻留加权实时档位）。
 
             安装：用 TrollStore / 巨魔安装 Statusbar.ipa。
-            ⚠️ 装后**重启一次设备**，让 HUD 守护进程加载含新权限的新二进制；打开 Statusbar，
-               诊断与频率都应刷新（HUD(root) 应写出 `subscribe=ok`）。
+            ⚠️ 装后**重启一次设备**，让 HUD 守护进程加载新二进制；打开 Statusbar 刷新诊断。
 
             使用：Statusbar → Customize → 添加部件。
 
             说明：
-              · 温度此前已正常（用户确认），其读数来源不依赖本权限；本版权限主要解锁频率。
+              · 温度正常是靠 HID 兜底（不是 IOReport）。
               · 占用率走 host_processor_info，与权限无关，本就正常。
-              · 频率显示 -- 表示共享文件暂无新鲜读数（启动后前 0.5 秒），随后为 1 秒步进。
               · 蜂窝信号显示 -- 时，进该部件的设置页看「状态」一行：
                 「不可用」说明 CommCenter 权限没生效，不是没有信号。
 
