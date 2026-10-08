@@ -51,12 +51,24 @@
 /// Dependent adds per iteration. Changing this means changing the asm below.
 #define PROBE_UNROLL 32
 
-/// Warm-up rounds — only there to get the clock up. Discarded. ~5 ms.
-#define PROBE_WARMUP_ROUNDS 400000
+/// Warm-up: spin until the clock has had time to reach its target.
+///
+/// Apple's DVFS response takes **tens of milliseconds**, so a *fixed iteration
+/// count* is the wrong shape: at a low starting clock it warms up for far less wall
+/// time than intended, and the measured rounds then sample a **partially ramped**
+/// clock — which is exactly why the readout used to sit at ~1000-2000 MHz and never
+/// reach the top gear (2376 on this device), even under load. Spin in fixed chunks
+/// until ~50 ms of wall time has elapsed instead.
+#define PROBE_WARMUP_TARGET_NS (50ull * 1000000ull)
+#define PROBE_WARMUP_CHUNK 300000
 
-/// Measured rounds: ~4 ms each, three of them, best one wins.
+/// Measured rounds: ~4 ms each, five of them, best one wins.
+///
+/// Five rather than three: under load a round is easily interrupted by the
+/// scheduler, and the reported maximum is only as good as the cleanest round it saw.
+/// Five rounds makes a fully-ramped, uninterrupted sample much more likely.
 #define PROBE_MEASURE_ROUNDS 300000
-#define PROBE_MEASURE_ROUND_COUNT 3
+#define PROBE_MEASURE_ROUND_COUNT 5
 
 /// Plausibility window, in MHz.
 ///
@@ -143,7 +155,15 @@ static void *probe_thread_main(void *context)
     // still measure, the reading is just more likely to come out low.
     (void)pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 
-    (void)probe_run(PROBE_WARMUP_ROUNDS);
+    // Warm up until ~50 ms of wall time has elapsed, so the clock is fully ramped
+    // before the measured rounds begin (see PROBE_WARMUP_TARGET_NS). Spinning in
+    // chunks rather than a single fixed count is what makes this time-based.
+    uint64_t warmed = 0;
+    while (warmed < PROBE_WARMUP_TARGET_NS) {
+        uint64_t chunk = probe_run(PROBE_WARMUP_CHUNK);
+        if (chunk == 0) break;   // never expected; guards against a spin if the timer misbehaves
+        warmed += chunk;
+    }
 
     uint64_t best = 0;
     for (int round = 0; round < PROBE_MEASURE_ROUND_COUNT; round++) {
