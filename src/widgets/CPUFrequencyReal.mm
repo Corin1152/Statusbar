@@ -773,7 +773,7 @@ NSString *helium_real_cpu_frequency_diagnosis(void)
     [out appendString:@"Self-check:\n"];
     [out appendFormat:@"  uid=%d gid=%d euid=%d\n", getuid(), getgid(), geteuid()];
     appendOwnEntitlements(out);
-    [out appendString:@"  Busy-loop probe samples (each ~15-20 ms):\n"];
+    [out appendString:@"  Busy-loop probe samples (2 threads x ~62 ms per sample):\n"];
     for (int i = 0; i < 5; i++) {
         uint64_t m = helium_measure_cpu_frequency_mhz();
         [out appendFormat:@"     sample %d: %llu MHz\n", i + 1, m];

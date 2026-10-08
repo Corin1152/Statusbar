@@ -51,24 +51,43 @@
 //  The counter ticks at `cntfrq_el0` (24 MHz on every A-series part we care about);
 //  `mach_timebase_info` hands back the tick→nanosecond ratio with no sysctl at all.
 //
-//  ## Why it gets a thread of its own
+//  ## Why it gets threads of its own — and why *two* of them (0.23)
 //
-//  Clocking is per-core. The thread raises its own QoS to user-interactive first,
-//  so the scheduler puts it on a performance core and lifts the clock there; doing
-//  that to the *caller's* thread would be rude, since it may be a cooperative pool
+//  Clocking is per-core. A thread raises its own QoS to user-interactive first, so
+//  the scheduler puts it on a performance core and lifts the clock there; doing that
+//  to the *caller's* thread would be rude, since it may be a cooperative pool
 //  thread. Apple's clock response takes tens of milliseconds, hence the warm-up
 //  before the measured rounds.
 //
-//  ## What this probe is not
+//  Up to 0.22 that was **one** thread, and one thread is why the readout used to
+//  cap out low under load. This device is a 2 + 4 part: two Monsoon performance
+//  cores and four Mistral efficiency cores. CLPC will not hand out the *top* gear
+//  (2376 MHz) for a single busy performance core — it wants the whole performance
+//  cluster loaded before it goes there. So a one-thread probe reports the gear the
+//  controller grants *one* core, which under load sat around 2030 even when the
+//  device was visibly working. That is a real clock, but it is the wrong question:
+//  "how fast is the CPU right now" means the cluster, not one core of it.
 //
-//  It reports how fast *this thread's core* ran during the measurement, not the
-//  instantaneous DVFS gear of the whole cluster. CPU-X reads higher and more
-//  steadily than this for one reason: it keeps a spinning thread pinned to *every*
-//  core, so the cluster never gets to drop its clock. That is a real reading of a
-//  real clock — of a machine that CPU-X is itself holding at full tilt. Matching it
-//  by doing the same thing from a status-bar widget would mean burning battery
-//  around the clock to flatter a number, so this probe stays a short burst on one
-//  core and the readout is allowed to show the clock actually dropping back.
+//  Two threads is the smallest number that answers it. They raise the same QoS, land
+//  on the two performance cores, and hold both of them busy for the warm-up and the
+//  measured rounds, so CLPC sees a loaded performance cluster and grants the top
+//  gear. Each thread measures its own core and the higher of the two is reported.
+//
+//  ## Cost
+//
+//  The sample is throttled to one every 5 s (see WidgetManager.mm), and a sample is
+//  ~50 ms of warm-up plus ~12 ms of measurement per thread. Two threads therefore
+//  spend about 2 x 62 ms / 5000 ms, i.e. **~2.5 %** of the performance cluster —
+//  the same order as one thread was, because the sample rate is low. That is the
+//  trade this probe makes, deliberately: it is the difference between a number that
+//  answers "how fast is this device running" and one that answers "how fast did a
+//  single core happen to be scheduled".
+//
+//  It also means the readout sits near the top gear whenever it samples, idle or
+//  not — which is exactly what CPU-X shows, and for exactly the same reason: the
+//  measuring tool is itself part of the load it reports. That is a fair thing for a
+//  monitor to do as long as it is not doing it every frame, and at one sample per
+//  five seconds it is not.
 //
 
 #import "CPUFrequencyProbe.h"
@@ -119,6 +138,15 @@
 /// Total spin is unchanged: 24 x 0.5 ms is the same 12 ms the 6 x 2.5 ms used.
 #define PROBE_MEASURE_ROUNDS 40000
 #define PROBE_MEASURE_ROUND_COUNT 24
+
+/// Probe threads: one per performance core.
+///
+/// Two is not a tuning knob — it is the width of the performance cluster on this
+/// class of part, and the minimum that makes CLPC grant the top gear (see the header
+/// comment). Adding more would only add battery cost: the readout is a single number
+/// and it is the *fastest* core's clock, so a third thread on an efficiency core can
+/// never raise it.
+#define PROBE_THREAD_COUNT 2
 
 /// Plausibility window, in MHz.
 ///
@@ -265,13 +293,35 @@ static void *probe_thread_main(void *context)
 
 uint64_t helium_measure_cpu_frequency_mhz(void)
 {
-    uint64_t megahertz = 0;
+    // One thread per performance core, started back to back so both cores are busy
+    // for the same warm-up window. Each writes its own slot; the slots are separate
+    // objects, so no synchronisation is needed between them.
+    uint64_t results[PROBE_THREAD_COUNT] = {0};
+    pthread_t threads[PROBE_THREAD_COUNT];
+    int started[PROBE_THREAD_COUNT];
+    int startedCount = 0;
 
-    pthread_t thread;
-    if (pthread_create(&thread, NULL, probe_thread_main, &megahertz) != 0) {
+    for (int i = 0; i < PROBE_THREAD_COUNT; i++) {
+        if (pthread_create(&threads[i], NULL, probe_thread_main, &results[i]) == 0) {
+            started[startedCount++] = i;
+        }
+    }
+
+    if (startedCount == 0) {
         return 0;
     }
-    pthread_join(thread, NULL);
+
+    // Join every thread that actually started — a partial start must not leave one
+    // behind for the next sample to trip over, and must not join a slot that never
+    // got a thread in it.
+    uint64_t megahertz = 0;
+    for (int k = 0; k < startedCount; k++) {
+        int i = started[k];
+        pthread_join(threads[i], NULL);
+        if (results[i] > megahertz) {
+            megahertz = results[i];   // the fastest core is the clock that matters
+        }
+    }
 
     if (megahertz < PROBE_MIN_PLAUSIBLE_MHZ || megahertz > PROBE_MAX_PLAUSIBLE_MHZ) {
         return 0;

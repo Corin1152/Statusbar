@@ -1103,11 +1103,12 @@ static BOOL gCPUFrequencySampling = NO;
 // How long a measured clock stays usable.
 //
 // Two reasons this is seconds rather than "every redraw". The obvious one is cost:
-// the probe is a ~15-20 ms full-speed busy loop, so running it per second would
-// spend about 2 % of a performance core forever.
+// the probe is a ~62 ms busy loop on each performance core (50 ms warm-up + 12 ms of
+// measured rounds, two threads — see CPUFrequencyProbe.mm), so running it per second
+// would spend about 12 % of the performance cluster forever.
 //
 // The other one is that the probe would be measuring its own effect. It raises the
-// clock on the core it lands on in order to read a meaningful number, so sampling
+// clock on the cores it lands on in order to read a meaningful number, so sampling
 // it every second would keep the CPU boosted — the widget would be causing part of
 // the load it reports, and the battery cost of a status-bar readout would be real.
 // Between samples the readout repeats the last measurement, which is what every
@@ -1116,6 +1117,7 @@ static BOOL gCPUFrequencySampling = NO;
 // 5 s rather than the old 3 s: same reasoning, taken a step further. The probe is
 // also what made the device warm, and it runs at user-interactive QoS so it can
 // preempt the foreground UI — sampling it less often is a straight win on both.
+// At 5 s the two threads together come to ~2.5 % of the performance cluster.
 #define CPU_FREQUENCY_SAMPLE_SECONDS 5.0
 
 static dispatch_queue_t cpuFrequencyQueue(void)
