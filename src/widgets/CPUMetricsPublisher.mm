@@ -68,46 +68,43 @@ static NSArray<NSString *> *sharedMetricPaths(void)
 static void publishOnce(void)
 {
     @autoreleasepool {
-        double usage = HeliumCPUUsageFraction();
-        NSArray<NSNumber *> *perCore = HeliumCPUPerCoreFractions() ?: @[];
-
-        // The HUD ("-hud" daemon) is the authoritative publisher of the real
-        // (IOReport) frequency; the main app preserves that reading rather than
-        // replacing it. Read back the existing shared file and, if the HUD left a
-        // fresh real reading, keep it.
-        uint64_t existingIOReportMHz = 0;
-        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-        for (NSString *path in sharedMetricPaths()) {
-            // The shared file is JSON (NSJSONSerialization), not a plist — so
-            // dictionaryWithContentsOfFile: returns nil and would drop the HUD's
-            // real reading. Parse it as JSON.
-            NSData *data = [NSData dataWithContentsOfFile:path];
-            if (!data) continue;
-            NSError *err = nil;
-            NSDictionary *prev = [NSJSONSerialization JSONObjectWithData:data options:0 error:&err];
-            if (![prev isKindOfClass:[NSDictionary class]]) continue;
-            if ([prev[@"freq_source"] isEqualToString:@"ioreport"]) {
-                uint64_t fm = [prev[@"freq_mhz"] unsignedLongLongValue];
-                NSTimeInterval t = [prev[@"ts"] doubleValue];
-                if (fm > 0 && (now - t) < 5.0) { existingIOReportMHz = fm; break; }
+        // The HUD ("-hud", root) is the authoritative publisher: it runs for as long
+        // as the device is up and refreshes the file every second. So the main app
+        // has nothing to add while the HUD is alive — and running a second busy-loop
+        // probe there would only fight the HUD's for a performance core and heat the
+        // device. The main app therefore publishes ONLY when the file has gone stale,
+        // i.e. when the HUD is not writing: it is a backup, not a peer.
+        if (getuid() != 0) {
+            NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+            for (NSString *path in sharedMetricPaths()) {
+                NSData *data = [NSData dataWithContentsOfFile:path];
+                if (!data) continue;
+                NSDictionary *j = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+                if (![j isKindOfClass:[NSDictionary class]]) continue;
+                NSTimeInterval t = [j[@"ts"] doubleValue];
+                if (t > 0 && (now - t) < 3.0) {
+                    return;   // the HUD is publishing — nothing for us to do
+                }
             }
         }
 
+        double usage = HeliumCPUUsageFraction();
+        NSArray<NSNumber *> *perCore = HeliumCPUPerCoreFractions() ?: @[];
+
+        // IOReport is unusable on this device, so there is no real reading to
+        // preserve. The old "read the shared file back and keep an ioreport reading"
+        // step was therefore pure waste — two file reads + two JSON parses every
+        // second, hunting for a value that can never appear. Removed.
         uint64_t mhz = 0;
         NSString *source = @"probe";
         if (getuid() == 0) {
-            // HUD (root daemon): read the actual DVFS residency from IOReport.
+            // HUD (root daemon): try the real DVFS residency first. On this device it
+            // always returns 0, so we fall straight through to the probe below.
             mhz = helium_real_cpu_frequency_mhz();
             if (mhz > 0) source = @"ioreport";
         }
-        if (mhz == 0 && existingIOReportMHz > 0) {
-            // Non-root process, but the HUD's real reading is still fresh — preserve it.
-            mhz = existingIOReportMHz;
-            source = @"ioreport";
-        }
         if (mhz == 0) {
-            // Fall back to the busy-loop probe (peak achievable clock, not the live
-            // DVFS step). Honest label: "probe".
+            // Busy-loop probe (peak achievable clock, not the live DVFS step).
             HeliumCPUFrequencyKick();
             mhz = HeliumCPUFrequencyKHz() / 1000ull;
             source = @"probe";
@@ -144,13 +141,25 @@ void helium_start_cpu_metrics_publisher(void)
         dispatch_queue_t queue = dispatch_queue_create("com.leemin.helium.cpumetrics",
                                                        DISPATCH_QUEUE_SERIAL);
 
-        // One-shot: write the IOReport / device-tree report so it can be read back
-        // without a debugger. Written on every run so the file is never stale.
-        // IOReport subscription is gated by com.apple.private.ioreport.allow (0.15),
-        // not by uid, so whichever process this is attempts the real subscription and
-        // the report shows the truth. Done off the main thread (building a
-        // subscription is not free).
-        dispatch_async(queue, ^{
+        // The IOReport / device-tree report is now **opt-in**, and runs on its OWN
+        // queue.
+        //
+        // Why: building it enumerates every channel IOReport exposes (thousands),
+        // attempts a whole-set subscription and walks ~700 groups — heavy enough to
+        // be felt, and it used to run on this very serial queue, which delayed the
+        // publisher's first write. IOReport turned out to be unusable on this device,
+        // so by default we do NOT build it. To get a report, create
+        //     /var/mobile/Documents/HeliumCPUFreqDiag.enable
+        // and reopen the app.
+        //
+        // The separate queue means that even when enabled it can never block the
+        // 1 Hz publish loop below.
+        dispatch_queue_t diagQueue = dispatch_queue_create("com.leemin.helium.cpudiag",
+                                                           DISPATCH_QUEUE_SERIAL);
+        dispatch_async(diagQueue, ^{
+            if (![[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HeliumCPUFreqDiag.enable"]) {
+                return;
+            }
             @try { (void)helium_real_cpu_frequency_diagnosis(); } @catch (NSException *e) { }
         });
 

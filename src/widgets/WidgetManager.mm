@@ -1045,76 +1045,35 @@ static BOOL cpuBusyFractions(double **outFractions, natural_t *outCount)
     return YES;
 }
 
-/// Per-core busy fractions from the shared file — the SAME value SysProbe reads.
-/// Returns nil when the file is missing or stale (> 5 s), so the caller can fall
-/// back to its own host_processor_info delta.
-///
-/// Reading the shared file here (rather than recomputing locally) is what makes the
-/// two apps show the same number: the publisher's tick and this widget's redraw are
-/// not phase-locked, so two independent local computations would drift apart even
-/// though both come from the same kernel counters.
-static NSArray<NSNumber *> *heliumSharedCPUPerCore(void)
-{
-    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-    for (NSString *path in @[ @"/var/tmp/cpu_metrics.json",
-                              @"/var/mobile/Library/Caches/cpu_metrics.json" ]) {
-        NSData *data = [NSData dataWithContentsOfFile:path];
-        if (!data) continue;
-        NSDictionary *j = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-        if (![j isKindOfClass:[NSDictionary class]]) continue;
-        NSNumber *tsNum = j[@"ts"];
-        if (!tsNum) continue;
-        if (!((now - [tsNum doubleValue]) < 5.0)) continue;
-        NSArray<NSNumber *> *pc = j[@"per_core"];
-        if ([pc isKindOfClass:[NSArray class]] && pc.count > 0) return pc;
-        NSNumber *u = j[@"usage"];
-        if ([u isKindOfClass:[NSNumber class]]) return @[ u ];
-    }
-    return nil;
-}
-
 /// `mode`: 0 = average across cores, 1 = busiest core.
+///
+/// **Reads the in-process value, not the shared file.** This runs on the render
+/// path (every redraw), and doing file I/O there is exactly the kind of thing that
+/// shows up as jank. It is also unnecessary: the publisher writes
+/// `HeliumCPUUsageFraction()` — the very same `cpuBusyFractions()` result computed
+/// here — so the widget and the published file carry the same number, and SysProbe
+/// (which does read the file) still agrees. Both callers share the 0.25 s cache, so
+/// within a redraw they are literally the same sample.
 static NSString* formattedCPUUsage(NSInteger mode, BOOL showPercentage, NSInteger decimals)
 {
-    double value = 0.0;
-    BOOL haveValue = NO;
-
-    // Prefer the shared file (the value SysProbe renders) so the two apps agree.
-    NSArray<NSNumber *> *sharedPerCore = heliumSharedCPUPerCore();
-    if (sharedPerCore.count > 0) {
-        if (mode == 1) {
-            for (NSNumber *n in sharedPerCore) {
-                if (n.doubleValue > value) value = n.doubleValue;
-            }
-        } else {
-            for (NSNumber *n in sharedPerCore) {
-                value += n.doubleValue;
-            }
-            value /= (double)sharedPerCore.count;
-        }
-        haveValue = YES;
+    double *fractions = NULL;
+    natural_t count = 0;
+    if (!cpuBusyFractions(&fractions, &count) || fractions == NULL || count == 0) {
+        return @"--";
     }
 
-    if (!haveValue) {
-        // Fall back to the local host_processor_info delta only when the file is
-        // missing/stale (no publisher running).
-        double *fractions = NULL;
-        natural_t count = 0;
-        if (!cpuBusyFractions(&fractions, &count) || fractions == NULL || count == 0) {
-            return @"--";
-        }
-        if (mode == 1) {
-            for (natural_t i = 0; i < count; i++) {
-                if (fractions[i] > value) {
-                    value = fractions[i];
-                }
+    double value = 0.0;
+    if (mode == 1) {
+        for (natural_t i = 0; i < count; i++) {
+            if (fractions[i] > value) {
+                value = fractions[i];
             }
-        } else {
-            for (natural_t i = 0; i < count; i++) {
-                value += fractions[i];
-            }
-            value /= (double)count;
         }
+    } else {
+        for (natural_t i = 0; i < count; i++) {
+            value += fractions[i];
+        }
+        value /= (double)count;
     }
 
     // A tick counter that wrapped, or a core that came online mid-sample, can push
@@ -1129,9 +1088,9 @@ static NSString* formattedCPUUsage(NSInteger mode, BOOL showPercentage, NSIntege
 
 // MARK: - CPU frequency
 
-// The formatter reads the shared file (written by CPUMetricsPublisher at 1 Hz,
-// IOReport-sourced when the HUD is root) as its primary source, so it matches
-// SysProbe step-for-step. The local probe below is only the cold-start fallback.
+// The formatter reads the in-process probe cache; the publisher writes that same
+// value to the shared file so SysProbe can read it. Keeping the file I/O out of the
+// render path matters — see the note on formattedCPUUsage.
 //
 // kHz; 0 means "no usable reading yet". An integer rather than a double so the
 // sampling queue and the render path can share it without a lock — a naturally
@@ -1153,7 +1112,11 @@ static BOOL gCPUFrequencySampling = NO;
 // the load it reports, and the battery cost of a status-bar readout would be real.
 // Between samples the readout repeats the last measurement, which is what every
 // other monitor does too.
-#define CPU_FREQUENCY_SAMPLE_SECONDS 3.0
+//
+// 5 s rather than the old 3 s: same reasoning, taken a step further. The probe is
+// also what made the device warm, and it runs at user-interactive QoS so it can
+// preempt the foreground UI — sampling it less often is a straight win on both.
+#define CPU_FREQUENCY_SAMPLE_SECONDS 5.0
 
 static dispatch_queue_t cpuFrequencyQueue(void)
 {
@@ -1188,60 +1151,21 @@ static void cpuFrequencyScheduleIfStale(void)
 
 /// `unit`: 0 = GHz, 1 = MHz.
 ///
-/// **Source: the shared file written by CPUMetricsPublisher at 1 Hz.**
+/// **Reads the in-process probe cache, not the shared file.** Same reasoning as
+/// `formattedCPUUsage`: this runs on the render path, and the value is identical to
+/// what the publisher writes (`HeliumCPUFrequencyKHz()` returns the very same
+/// `gCPUFrequencyKHz` the file carries), so there is no reason to pay for file I/O
+/// here. The publisher still writes the file so SysProbe can read it.
 ///
-/// The publisher (in this same HUD process) samples once a second and, when the
-/// HUD is running as root, sources the clock from IOReport's real DVFS residency —
-/// the actual current frequency step, not the peak a busy loop can coax out of the
-/// core. That is also the exact figure SysProbe renders, so the two readouts step
-/// together at 1 Hz instead of drifting. We read that file here rather than keeping
-/// our own 3 s probe, so the widget and SysProbe can never disagree on frequency.
-///
-/// The local busy-loop probe (`gCPUFrequencyKHz`) survives only as a fallback for
-/// the first half-second after launch (the publisher's first write lands ~0.5 s
-/// in) or if the shared file is ever missing or stale. It is no longer the primary
-/// path, so it can no longer keep the core boosted just to feed a status-bar number.
-static uint64_t heliumSharedCPUFrequencyMHz(void)
-{
-    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-    uint64_t best = 0;
-    for (NSString *path in @[ @"/var/tmp/cpu_metrics.json",
-                              @"/var/mobile/Library/Caches/cpu_metrics.json" ]) {
-        // The shared file is JSON (NSJSONSerialization), not a plist — so
-        // dictionaryWithContentsOfFile: would return nil. Parse it as JSON.
-        NSData *data = [NSData dataWithContentsOfFile:path];
-        if (!data) continue;
-        NSError *err = nil;
-        NSDictionary *prev = [NSJSONSerialization JSONObjectWithData:data options:0 error:&err];
-        if (![prev isKindOfClass:[NSDictionary class]]) continue;
-        NSNumber *fmNum = prev[@"freq_mhz"];
-        NSNumber *tsNum = prev[@"ts"];
-        if (!fmNum || !tsNum) continue;
-        uint64_t fm = [fmNum unsignedLongLongValue];
-        NSTimeInterval t = [tsNum doubleValue];
-        // 5 s freshness to match the publisher's own preserve-window; pick the
-        // freshest file that actually carries a reading.
-        if (fm > 0 && (now - t) < 5.0 && fm > best) {
-            best = fm;
-        }
-    }
-    return best;
-}
-
+/// The first redraw after launch shows "--" and the next one a number (the probe is
+/// asynchronous), which is the same behaviour as before.
 static NSString* formattedCPUFrequency(NSInteger unit)
 {
-    uint64_t khz = 0;
-    uint64_t sharedMHz = heliumSharedCPUFrequencyMHz();
-    if (sharedMHz > 0) {
-        // Primary: the 1 Hz shared-file value (IOReport when the HUD is root).
-        khz = sharedMHz * 1000ull;
-    } else {
-        // Fallback: only while the shared file is missing/stale. Kick the local
-        // probe so a cold start still resolves to a number after one redraw.
-        cpuFrequencyScheduleIfStale();
-        khz = gCPUFrequencyKHz;
-    }
+    // Never block the render path: ask for a fresh sample if the cache is stale,
+    // then report whatever the last one produced.
+    cpuFrequencyScheduleIfStale();
 
+    uint64_t khz = gCPUFrequencyKHz;
     if (khz == 0) {
         return @"--";
     }

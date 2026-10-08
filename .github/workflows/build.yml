@@ -99,33 +99,35 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: statusbar-${{ github.run_number }}
-          name: Statusbar 0.18 (build ${{ github.run_number }})
+          name: Statusbar 0.19 (build ${{ github.run_number }})
           body: |
-            基于 Helium 改版。应用名改为 Statusbar，版本从 0.01 起（本次 0.18）。
+            基于 Helium 改版。应用名改为 Statusbar，版本从 0.01 起（本次 0.19）。
 
             界面：只有「首页 / 自定义」两页，首页右上角直接显示版本号（无齿轮/设置入口）。
             部件：原有 9 个 + CPU温度 / CPU占用 / CPU频率 / 蜂窝信号（RSRP）。
 
-            本次改动（让两个 App 的占用率/频率真正同步）：
-              · 0.17 自检已把 IOReport 钉死：`com.apple.private.ioreport.allow = PRESENT`，
-                但按组订阅与整通道集订阅**全部 REFUSED** → 真实档位在这台机上拿不到。
-                频率显示的是忙循环探针值（实测在 1659–1809 MHz 间跳动，非恒定峰值）。
-              · 同步问题的根因：**Statusbar 的「占用」部件此前是本地现算**
-                （`cpuBusyFractions()`），而 SysProbe 读的是共享文件 —— 两者采样相位错开，
-                自然对不上。频率部件在 0.14 已改读共享文件。
-              · 本版让**占用部件也读共享文件**（`usage` / `per_core`，5s 新鲜度），
-                与 SysProbe 完全同源；只有文件缺失/过期（发布器没跑）时才回落本地自算。
-                → 两个 App 的占用率与频率都来自同一份文件，显示同一个数。
-              · 诊断的「Shared file readings」增加 `age=` 与 `usage` / `per_core` 计数，
-                便于判断文件是否陈旧（陈旧会让两边各自自采、再次分叉）。
+            本次改动（降负载 / 减卡顿 / 少发热）：
+              · 反馈：0.18 装后整机明显卡顿、发热更高；排查确认负载在 HUD 侧。
+                本版逐条砍掉多余的持续负载：
+              · ① 诊断默认**不跑**：它要枚举 6455 个 IOReport 通道、试整通道集订阅、
+                逐个查 ~700 个组 —— 很重，且原先跑在发布器同一条队列上、会堵住发布。
+                IOReport 已确认在本机不可用，故默认不建报告；需要时创建
+                `/var/mobile/Documents/HeliumCPUFreqDiag.enable` 再打开 App 即可，
+                且已挪到**独立队列**，永不再堵发布器。
+              · ② 删掉发布器每秒无用的「回读共享文件」（IOReport 已死，永远读不到 ioreport）。
+              · ③ 主 App 只当**备份发布器**：HUD 在写文件时它直接跳过（不跑探针、不写文件）。
+              · ④ 占用/频率部件改回**读进程内值**，渲染路径**零文件 I/O**（不再每次重绘读文件）。
+                值仍与写进文件的一致（发布器写的就是同一函数的结果）。
+              · ⑤ 忙循环探针间隔 3s → **5s**：少抢前台 UI、少顶频发热。
+                （刻意**不**降探针 QoS —— 那会让读数偏低/失真。）
 
             安装：用 TrollStore / 巨魔安装 Statusbar.ipa。
-            ⚠️ 装后**重启一次设备**，让 HUD 守护进程加载新二进制；打开 Statusbar 刷新诊断。
+            ⚠️ 装后**重启一次设备**，让 HUD 守护进程加载新二进制。
 
             使用：Statusbar → Customize → 添加部件。
 
             说明：
-              · 两个 App 都读同一文件；若显示仍差一点，是各自 1s 轮询的相位差（≤1 个刷新周期）。
+              · 若仍嫌卡，可把状态栏的 Update Interval 调大（如 2s）—— 最直接的减负手段。
               · 温度正常是靠 HID 兜底（不是 IOReport）。
               · 蜂窝信号显示 -- 时，进该部件的设置页看「状态」一行：
                 「不可用」说明 CommCenter 权限没生效，不是没有信号。
