@@ -1045,27 +1045,76 @@ static BOOL cpuBusyFractions(double **outFractions, natural_t *outCount)
     return YES;
 }
 
+/// Per-core busy fractions from the shared file — the SAME value SysProbe reads.
+/// Returns nil when the file is missing or stale (> 5 s), so the caller can fall
+/// back to its own host_processor_info delta.
+///
+/// Reading the shared file here (rather than recomputing locally) is what makes the
+/// two apps show the same number: the publisher's tick and this widget's redraw are
+/// not phase-locked, so two independent local computations would drift apart even
+/// though both come from the same kernel counters.
+static NSArray<NSNumber *> *heliumSharedCPUPerCore(void)
+{
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    for (NSString *path in @[ @"/var/tmp/cpu_metrics.json",
+                              @"/var/mobile/Library/Caches/cpu_metrics.json" ]) {
+        NSData *data = [NSData dataWithContentsOfFile:path];
+        if (!data) continue;
+        NSDictionary *j = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        if (![j isKindOfClass:[NSDictionary class]]) continue;
+        NSNumber *tsNum = j[@"ts"];
+        if (!tsNum) continue;
+        if (!((now - [tsNum doubleValue]) < 5.0)) continue;
+        NSArray<NSNumber *> *pc = j[@"per_core"];
+        if ([pc isKindOfClass:[NSArray class]] && pc.count > 0) return pc;
+        NSNumber *u = j[@"usage"];
+        if ([u isKindOfClass:[NSNumber class]]) return @[ u ];
+    }
+    return nil;
+}
+
 /// `mode`: 0 = average across cores, 1 = busiest core.
 static NSString* formattedCPUUsage(NSInteger mode, BOOL showPercentage, NSInteger decimals)
 {
-    double *fractions = NULL;
-    natural_t count = 0;
-    if (!cpuBusyFractions(&fractions, &count) || fractions == NULL || count == 0) {
-        return @"--";
+    double value = 0.0;
+    BOOL haveValue = NO;
+
+    // Prefer the shared file (the value SysProbe renders) so the two apps agree.
+    NSArray<NSNumber *> *sharedPerCore = heliumSharedCPUPerCore();
+    if (sharedPerCore.count > 0) {
+        if (mode == 1) {
+            for (NSNumber *n in sharedPerCore) {
+                if (n.doubleValue > value) value = n.doubleValue;
+            }
+        } else {
+            for (NSNumber *n in sharedPerCore) {
+                value += n.doubleValue;
+            }
+            value /= (double)sharedPerCore.count;
+        }
+        haveValue = YES;
     }
 
-    double value = 0.0;
-    if (mode == 1) {
-        for (natural_t i = 0; i < count; i++) {
-            if (fractions[i] > value) {
-                value = fractions[i];
+    if (!haveValue) {
+        // Fall back to the local host_processor_info delta only when the file is
+        // missing/stale (no publisher running).
+        double *fractions = NULL;
+        natural_t count = 0;
+        if (!cpuBusyFractions(&fractions, &count) || fractions == NULL || count == 0) {
+            return @"--";
+        }
+        if (mode == 1) {
+            for (natural_t i = 0; i < count; i++) {
+                if (fractions[i] > value) {
+                    value = fractions[i];
+                }
             }
+        } else {
+            for (natural_t i = 0; i < count; i++) {
+                value += fractions[i];
+            }
+            value /= (double)count;
         }
-    } else {
-        for (natural_t i = 0; i < count; i++) {
-            value += fractions[i];
-        }
-        value /= (double)count;
     }
 
     // A tick counter that wrapped, or a core that came online mid-sample, can push

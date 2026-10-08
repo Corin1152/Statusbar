@@ -680,6 +680,7 @@ static void appendOwnEntitlements(NSMutableString *out)
 // on screen is the probe's or a real IOReport reading.
 static void appendSharedFileCheck(NSMutableString *out)
 {
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
     for (NSString *path in @[ @"/var/tmp/cpu_metrics.json",
                               @"/var/mobile/Library/Caches/cpu_metrics.json" ]) {
         NSData *d = [NSData dataWithContentsOfFile:path];
@@ -689,8 +690,11 @@ static void appendSharedFileCheck(NSMutableString *out)
             [out appendFormat:@"     %@ : (unparseable)\n", path];
             continue;
         }
-        [out appendFormat:@"     %@ : freq_mhz=%@ freq_source=%@ writer=%@ ts=%@\n",
-            path, j[@"freq_mhz"], j[@"freq_source"], j[@"writer"], j[@"ts"]];
+        NSTimeInterval ts = [j[@"ts"] doubleValue];
+        NSArray *pc = [j[@"per_core"] isKindOfClass:[NSArray class]] ? j[@"per_core"] : @[];
+        [out appendFormat:@"     %@ : freq_mhz=%@ freq_source=%@ writer=%@ age=%.1fs usage=%@ per_core=%lu\n",
+            path, j[@"freq_mhz"], j[@"freq_source"], j[@"writer"], now - ts,
+            j[@"usage"], (unsigned long)pc.count];
     }
 }
 

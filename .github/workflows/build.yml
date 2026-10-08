@@ -99,26 +99,25 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: statusbar-${{ github.run_number }}
-          name: Statusbar 0.17 (build ${{ github.run_number }})
+          name: Statusbar 0.18 (build ${{ github.run_number }})
           body: |
-            基于 Helium 改版。应用名改为 Statusbar，版本从 0.01 起（本次 0.17）。
+            基于 Helium 改版。应用名改为 Statusbar，版本从 0.01 起（本次 0.18）。
 
             界面：只有「首页 / 自定义」两页，首页右上角直接显示版本号（无齿轮/设置入口）。
             部件：原有 9 个 + CPU温度 / CPU占用 / CPU频率 / 蜂窝信号（RSRP）。
 
-            本次改动（自检版：把「频率到底能不能读真实值」钉死）：
-              · 0.16 诊断已证明：即便 HUD 是 root、`com.apple.private.ioreport.allow` 也确实在
-                二进制签名里，IOReport 全部订阅仍 `REFUSED`；温度部件是靠 **HID 传感器兜底**
-                才正常。
-              · 本版在诊断开头加「Self-check」段，直接给出四件事：
-                  1) 本进程自身的 entitlements（用 Security.framework 的 SecTask 读回，
-                     确认 `com.apple.private.ioreport.allow` 等对进程是否真的生效）；
-                  2) 忙循环探针的 5 次原始采样值（看清频率显示的到底是什么）；
-                  3) 共享文件当前读数（freq_mhz / freq_source / writer）；
-                  4) 另试一次「整通道集」订阅（`IOReportCopyAllChannels`，与按组订阅是不同
-                     代码路径，可能结果不同）。
-              · 频率行为不变：仍来自忙循环探针，随负载/温度在 DVFS 档位间跳动（不是固定峰值，
-                但也不是 IOReport 的按驻留加权实时档位）。
+            本次改动（让两个 App 的占用率/频率真正同步）：
+              · 0.17 自检已把 IOReport 钉死：`com.apple.private.ioreport.allow = PRESENT`，
+                但按组订阅与整通道集订阅**全部 REFUSED** → 真实档位在这台机上拿不到。
+                频率显示的是忙循环探针值（实测在 1659–1809 MHz 间跳动，非恒定峰值）。
+              · 同步问题的根因：**Statusbar 的「占用」部件此前是本地现算**
+                （`cpuBusyFractions()`），而 SysProbe 读的是共享文件 —— 两者采样相位错开，
+                自然对不上。频率部件在 0.14 已改读共享文件。
+              · 本版让**占用部件也读共享文件**（`usage` / `per_core`，5s 新鲜度），
+                与 SysProbe 完全同源；只有文件缺失/过期（发布器没跑）时才回落本地自算。
+                → 两个 App 的占用率与频率都来自同一份文件，显示同一个数。
+              · 诊断的「Shared file readings」增加 `age=` 与 `usage` / `per_core` 计数，
+                便于判断文件是否陈旧（陈旧会让两边各自自采、再次分叉）。
 
             安装：用 TrollStore / 巨魔安装 Statusbar.ipa。
             ⚠️ 装后**重启一次设备**，让 HUD 守护进程加载新二进制；打开 Statusbar 刷新诊断。
@@ -126,8 +125,8 @@ jobs:
             使用：Statusbar → Customize → 添加部件。
 
             说明：
+              · 两个 App 都读同一文件；若显示仍差一点，是各自 1s 轮询的相位差（≤1 个刷新周期）。
               · 温度正常是靠 HID 兜底（不是 IOReport）。
-              · 占用率走 host_processor_info，与权限无关，本就正常。
               · 蜂窝信号显示 -- 时，进该部件的设置页看「状态」一行：
                 「不可用」说明 CommCenter 权限没生效，不是没有信号。
 
