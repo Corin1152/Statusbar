@@ -12,6 +12,7 @@
 #import <sys/types.h>
 #import <sys/sysctl.h>
 #import <objc/runtime.h>
+#import <os/lock.h>
 #import "WidgetManager.h"
 #import <IOKit/IOKitLib.h>
 #import "../extensions/LunarDate.h"
@@ -796,6 +797,26 @@ static BOOL ensureHIDSymbols(void)
     return (pHIDCreate && pHIDSetMatching && pHIDCopyServices && pHIDCopyEvent && pHIDGetFloat);
 }
 
+// The HID event-system client: created once per process, then reused.
+//
+// Two reasons, and both matter.
+//
+// **Cost.** `IOHIDEventSystemClientCreate` builds a whole connection into the event
+// system; `SetMatching` + `CopyServices` then walk the service registry. The render
+// path calls this once a second for the temperature readout, so rebuilding it every
+// time is pure waste.
+//
+// **Correctness.** On iOS a sandboxed process gets one usable client — additional
+// ones come back with NaN for every service. SysProbe, which reads the very same
+// sensors, has kept a single client for exactly this reason.
+//
+// The lock covers the `SetMatching` + `CopyServices` pair and nothing else: matching
+// is client state, so two threads interleaving there would each read the other's
+// service list. Everything after that works on the array `CopyServices` handed back,
+// which carries a +1 reference of its own.
+static os_unfair_lock gHIDClientLock = OS_UNFAIR_LOCK_INIT;
+static IOHIDEventSystemClientRef gHIDClient = NULL;
+
 // Die sensors are preferred; battery / charger gauges are rejected outright.
 static int hidSensorScore(NSString *name)
 {
@@ -825,15 +846,21 @@ static double readHIDSensorTemperature(NSString **outName, NSMutableArray *dumpO
         @"PrimaryUsage": @(HELIUM_APPLE_TEMP_SENSOR)
     };
 
-    IOHIDEventSystemClientRef system = pHIDCreate(kCFAllocatorDefault);
-    if (!system) return NAN;
-
-    pHIDSetMatching(system, (__bridge CFDictionaryRef)query);
-    CFArrayRef services = pHIDCopyServices(system);
-    if (!services) {
-        CFRelease(system);
-        return NAN;
+    // Create-once-and-reuse (see `gHIDClient` above). The lock is held across the
+    // matching + copy pair only; `services` is a +1 reference of its own, so the
+    // polling below never touches the shared client.
+    os_unfair_lock_lock(&gHIDClientLock);
+    if (!gHIDClient) {
+        gHIDClient = pHIDCreate(kCFAllocatorDefault);
     }
+    IOHIDEventSystemClientRef system = gHIDClient;
+    if (system) {
+        pHIDSetMatching(system, (__bridge CFDictionaryRef)query);
+    }
+    CFArrayRef services = system ? pHIDCopyServices(system) : NULL;
+    os_unfair_lock_unlock(&gHIDClientLock);
+
+    if (!services) return NAN;
 
     double best = NAN;
     int bestScore = 0;
@@ -870,7 +897,8 @@ static double readHIDSensorTemperature(NSString **outName, NSMutableArray *dumpO
     }
 
     CFRelease(services);
-    CFRelease(system);
+    // `system` is deliberately not released here: it is the process-wide client kept
+    // in `gHIDClient`, and it lives until the process exits.
 
     if (outName) *outName = bestName;
     return best;
@@ -1100,6 +1128,12 @@ static uint64_t gCPUFrequencyKHz = 0;
 static CFAbsoluteTime gCPUFrequencyStamp = 0;
 static BOOL gCPUFrequencySampling = NO;
 
+/// Guards the `gCPUFrequencySampling` / `gCPUFrequencyStamp` pair and the
+/// check-then-act in `cpuFrequencyScheduleIfStale` below. **Not** the read of
+/// `gCPUFrequencyKHz` — see the paragraph above: an aligned 64-bit load is atomic on
+/// arm64 and it is only ever a readout hint.
+static os_unfair_lock gCPUFrequencyLock = OS_UNFAIR_LOCK_INIT;
+
 // How long a measured clock stays usable.
 //
 // Two reasons this is seconds rather than "every redraw". The obvious one is cost:
@@ -1137,17 +1171,34 @@ static void cpuFrequencyScheduleIfStale(void)
 
     // Throttled on time alone, success or failure: on a device where the probe
     // cannot produce a plausible number, keying off "do we have a value" would burn
-    // a 20 ms busy loop on every single redraw.
-    if (gCPUFrequencySampling || (now - gCPUFrequencyStamp) < CPU_FREQUENCY_SAMPLE_SECONDS) {
+    // a 62 ms busy loop on every single redraw.
+    //
+    // **The check-then-act has to be serialized as a whole.** This function has two
+    // callers and they are not on the same thread: `formattedCPUFrequency` on the
+    // render path (main thread) and `HeliumCPUFrequencyKick` on the publisher queue.
+    // Unsynced, both could pass the `gCPUFrequencySampling` check at once and each
+    // `dispatch_async` its own block — the serial queue would dutifully run the probe
+    // **twice**, burning 62 ms on two performance cores for nothing and letting the
+    // two probes steal each other's cores, which drags both readings down.
+    os_unfair_lock_lock(&gCPUFrequencyLock);
+    BOOL stale = (!gCPUFrequencySampling
+                  && (now - gCPUFrequencyStamp) >= CPU_FREQUENCY_SAMPLE_SECONDS);
+    if (stale) {
+        gCPUFrequencySampling = YES;
+    }
+    os_unfair_lock_unlock(&gCPUFrequencyLock);
+
+    if (!stale) {
         return;
     }
 
-    gCPUFrequencySampling = YES;
     dispatch_async(cpuFrequencyQueue(), ^{
         uint64_t megahertz = helium_measure_cpu_frequency_mhz();
-        gCPUFrequencyKHz = megahertz * 1000ull;   // 0 on failure; retried in 3 s
+        os_unfair_lock_lock(&gCPUFrequencyLock);
+        gCPUFrequencyKHz = megahertz * 1000ull;   // 0 on failure; retried in 5 s
         gCPUFrequencyStamp = CFAbsoluteTimeGetCurrent();
         gCPUFrequencySampling = NO;
+        os_unfair_lock_unlock(&gCPUFrequencyLock);
     });
 }
 

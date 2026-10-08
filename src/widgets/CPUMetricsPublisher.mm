@@ -32,6 +32,25 @@
 //  Two paths are written: /var/tmp is the primary, the Caches copy survives a
 //  reboot and covers setups where /var/tmp is not writable.
 //
+//  ## This file is the contract
+//
+//  **These two paths are the only cross-process contract between Helium and
+//  SysProbe.** There is no App Group and no XPC: the reader opens the same file and
+//  parses the same keys. So any change to the following breaks the other app
+//  *silently* — it keeps reading, finds no such key, and falls back to a zero or a
+//  dash, with nothing in any log to say why:
+//
+//    * the key names and their types,
+//    * the units (0..1 rather than 0..100; MHz rather than Hz),
+//    * the two paths, or which of them is tried first,
+//    * the freshness window the reader applies to `ts`.
+//
+//  Changing any of them means changing SysProbe's
+//  `Sources/Shared/Hardware/CPUSharedMetrics.swift` in the same breath and shipping
+//  both apps together. That reader is deliberately forgiving — unknown keys are
+//  ignored, a missing file is not an error — which is exactly why a mismatch shows
+//  up as a wrong number rather than as a failure.
+//
 //  ## Sampling cadence
 //
 //  Deliberately decoupled from the HUD's Update Interval. If the publisher used the

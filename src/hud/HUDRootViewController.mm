@@ -406,21 +406,54 @@ static void ReloadHUD
     }
 }
 
+/// 上一次真正画上去的文本，挂在 `maskLabel` 上。
+///
+/// **为什么挂在 label 上而不是存成 ivar**：`createWidgetSetsView` 会把这一整套
+/// label / maskLabel / backdrop 整个重建。重建出来的 label 没有关联对象，于是它的
+/// 第一帧必然重画 —— 这正是想要的语义，省掉一套「视图重建时记得清缓存」的代码。
+/// 存 ivar 反而要额外盯住每一处重建点。
+static const void *kHeliumLastAttributedTextKey = &kHeliumLastAttributedTextKey;
+
 - (void) updateLabel:(UILabel *) label updateMaskLabel:(UILabel *) maskLabel backdropView:(AnyBackdropView *) backdropView identifiers:(NSArray *) identifiers fontSize:(double) fontSize autoResizes:(BOOL) autoResizes width:(CGFloat) width height:(CGFloat) height
 {
 #if DEBUG
     os_log_debug(OS_LOG_DEFAULT, "updateLabel");
 #endif
     NSAttributedString *attributedText = formattedAttributedString(identifiers, fontSize, label.textColor, [self apiKey], [self dateLocale]);
-    if (attributedText) {
-        // NSLog(@"boom attr:%@", attributedText);
-        [label setAttributedText: attributedText];
-        [maskLabel setAttributedText: attributedText];
+    if (!attributedText)
+        return;
+
+    // 内容一个字都没变就整个跳过。
+    //
+    // `setAttributedText:` **无条件**把 label 标成需要重画，CoreText 于是从头排一遍版
+    // —— 每个 widget 每秒两次（正文一次、作为 `maskView` 的 maskLabel 再一次），
+    // 哪怕文本逐字节相同。状态栏上真正每秒都在动的只有 CPU 占用、温度那几个数字；
+    // 时间、日期、运营商、信号格这些是静的，跳过它们等于把常驻 HUD 稳态里最大的一块
+    // 排版开销直接砍掉。
+    //
+    // 比较放在 `setAttributedText:` **之前**，代价是一次很短的字符串加属性字典比对，
+    // 比它省下的那次排版便宜几个数量级；没命中也只是白比一次。
+    NSAttributedString *drawn = objc_getAssociatedObject(maskLabel, kHeliumLastAttributedTextKey);
+    if (drawn && [drawn isEqualToAttributedString: attributedText]) {
         if (autoResizes) {
-            [self useSizeThatFitsZeroWithLabel:maskLabel];
-        } else {
-            [self useSizeThatFitsCustomWithLabel:maskLabel width: width height: height];
+            // `sizeThatFits:` 的结果只取决于文本，文本没变尺寸就没变。
+            return;
         }
+        // `autoResizes == NO` 时 frame 是按设置里的宽高**显式**写的，那个值可能在两次
+        // 调用之间被改过（用户在设置里调了缩放），所以这里还要再比一次尺寸。
+        if (CGSizeEqualToSize(maskLabel.frame.size, CGSizeMake(width, height)))
+            return;
+    }
+    objc_setAssociatedObject(maskLabel, kHeliumLastAttributedTextKey, attributedText,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    // NSLog(@"boom attr:%@", attributedText);
+    [label setAttributedText: attributedText];
+    [maskLabel setAttributedText: attributedText];
+    if (autoResizes) {
+        [self useSizeThatFitsZeroWithLabel:maskLabel];
+    } else {
+        [self useSizeThatFitsCustomWithLabel:maskLabel width: width height: height];
     }
 }
 
