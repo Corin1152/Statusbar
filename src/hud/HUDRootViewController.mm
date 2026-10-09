@@ -234,7 +234,15 @@ static CFAbsoluteTime gLastReloadStamp = 0;
     [self reloadUserDefaults];
     [self resetLoopTimer];
     [self updateViewConstraints];
-    helium_dbg(@"performReload done");
+
+    // 首帧即画：不等第一个 tick（updateInterval 是用户可设的，最长可能好几秒）。
+    // 0.25 要等 tick 才有画面；这里 reload 完直接画一遍，启动到出画的延迟从
+    // 「一个周期」缩到「启动即出」。
+    NSArray *widgetProps = [self widgetProperties];
+    for (int i = 0; i < (int)[widgetProps count]; i++) {
+        [self drawWidgetSetAtIndex:i];
+    }
+    helium_dbg(@"performReload done (first frame drawn)");
 }
 
 - (void) reloadUserDefaults
@@ -509,6 +517,35 @@ static CFAbsoluteTime gLastReloadStamp = 0;
 /// 合并顺带还有一个好处：同一个 tick 里几个部件的取值是在**同一次**主线程 pass 上
 /// 做的，于是 `cpuBusyFractions` 的 0.25 s 缓存、`getBatteryInfo` 的短缓存真的被
 /// 复用上了 —— 原来它们各自落在不同的 pass 里，缓存形同虚设。
+/// 画第 i 个 set 的当前帧。定时器 tick 与启动首帧（`performReload` 末尾）都走
+/// 这里，保证两条路径的取参与判定完全一致。
+- (void)drawWidgetSetAtIndex:(int)i
+{
+    NSArray *widgetProps = [self widgetProperties];
+    if (i < 0 || i >= (int)[widgetProps count])
+        return;
+    if (i >= (int)_blurViews.count || i >= (int)_labelViews.count ||
+        i >= (int)_backdropViews.count || i >= (int)_maskLabelViews.count)
+        return;
+    UIVisualEffectView *blurView = [_blurViews objectAtIndex:i];
+    UILabel *labelView = [_labelViews objectAtIndex:i];
+    AnyBackdropView *backdropView = [_backdropViews objectAtIndex: i];
+    UILabel *maskLabelView = [_maskLabelViews objectAtIndex:i];
+
+    NSDictionary *properties = [widgetProps objectAtIndex:i];
+    if (!labelView || !maskLabelView || !properties)
+        return;
+    if (!getBoolFromDictKey(properties, @"isEnabled"))
+        return;
+    NSArray *identifiers = [properties objectForKey: @"widgetIDs"] ? [properties objectForKey: @"widgetIDs"] : @[];
+    double fontSize = [properties objectForKey: @"fontSize"] ? [[properties objectForKey: @"fontSize"] doubleValue] : 10.0;
+    BOOL autoResizes = getBoolFromDictKey(properties, @"autoResizes");
+    float width = getDoubleFromDictKey(properties, @"scale", 50.0);
+    float height = getDoubleFromDictKey(properties, @"scaleY", 12.0);
+
+    [self updateLabel: labelView updateMaskLabel: maskLabelView backdropView: backdropView identifiers: identifiers fontSize: fontSize autoResizes: autoResizes width: width height: height properties: properties];
+}
+
 - (void)resetLoopTimer
 {
     NSArray *widgetProps = [self widgetProperties];
@@ -521,19 +558,14 @@ static CFAbsoluteTime gLastReloadStamp = 0;
         NSDictionary *properties = [widgetProps objectAtIndex:i];
         if (!labelView || !maskLabelView || !properties)
             break;
-        NSArray *identifiers = [properties objectForKey: @"widgetIDs"] ? [properties objectForKey: @"widgetIDs"] : @[];
-        double fontSize = [properties objectForKey: @"fontSize"] ? [[properties objectForKey: @"fontSize"] doubleValue] : 10.0;
         double updateInterval = getDoubleFromDictKey(properties, @"updateInterval", 1.0);
         BOOL isEnabled = getBoolFromDictKey(properties, @"isEnabled");
-        BOOL autoResizes = getBoolFromDictKey(properties, @"autoResizes");
-        float width = getDoubleFromDictKey(properties, @"scale", 50.0);
-        float height = getDoubleFromDictKey(properties, @"scaleY", 12.0);
         NSString *timerName = [NSString stringWithFormat:@"widgetset%d", i];
         if (isEnabled) {
             helium_dbg(@"set%d: timer built (interval %.2f)", i, updateInterval);
             [[EZTimer shareInstance] timer:timerName timerInterval:updateInterval leeway:0.1 resumeType:EZTimerResumeTypeNow queue:EZTimerQueueTypeConcurrent queueName:@"update" repeats:YES action:^(NSString *name) {
                 dispatch_sync(dispatch_get_main_queue(), ^{
-                    [self updateLabel: labelView updateMaskLabel: maskLabelView backdropView: backdropView identifiers: identifiers fontSize: fontSize autoResizes: autoResizes width: width height: height properties: properties];
+                    [self drawWidgetSetAtIndex:i];
                 });
             }];
         } else {
@@ -550,92 +582,71 @@ static CFAbsoluteTime gLastReloadStamp = 0;
 
 /// 缓存键 `kHeliumLastAttributedTextKey` 声明在文件开头，见那里的说明。
 ///
-/// 只画**当前可见**的那一条渲染路径。
+/// **0.30 起恢复 0.25 的「双写」**，同时保留 0.26 的内容缓存。原因是一次完整的
+/// 真机定位（0.29 的诊断日志 `helium_hud_debug.log`）：
 ///
-/// 每个部件同时有两条路径，`reloadUserDefaults` 保证任意时刻至多只有一条可见：
+/// `maskLabel` 是 `backdropView` 的 `maskView` —— 它**不在视图层级里**，UIKit 的
+/// 常规显示管线不保证处理它的内容渲染。0.25 的代码每次都写那个隐藏的 `label`，
+/// 写入会 invalidate 它的 intrinsicContentSize、触发 `_contentView` 全树
+/// Auto Layout —— 这个布局过程顺带把 maskLabel 的内容渲染了进去，遮罩才有东西。
+/// 0.26 改成「只画可见路径」后这个副作用没有了：渲染链每秒都在把正确的文本写进
+/// maskLabel（0.29 日志证实：hidden 状态全对、缓存工作正常、内容正确），但屏幕上
+/// 什么都没有，直到用户手动调一次设置（`updateViewConstraints` 重建全部约束 →
+/// 一次全树布局 → 遮罩内容这才被渲染）。label 上的 Auto Layout 代价退回来是
+/// 有意的 —— 显示正确性优先；maskLabel 的显式 `displayIfNeeded` 作为第二重保险。
 ///
-///   dynamicColor == YES（默认）→ backdropView + maskLabel 可见，label 隐藏；
-///   dynamicColor == NO         → label 可见，backdrop 与 maskLabel 隐藏。
-///
-/// 原来两条都写，于是每 tick 白付一份代价 —— 而且是两份**性质完全不同**的代价：
-///
-///   * 写 `label` 会 invalidate 它的 intrinsicContentSize，`_contentView` 上那
-///     ~6N 条约束于是要整轮重解一次 Auto Layout；
-///   * 写 `maskLabel` 会换掉 `CABackdropLayer` 的遮罩，那一层挂着 5 个 CAFilter
-///     （半径 50 的高斯模糊 + 亮度 / 对比度 / 饱和度 / 反相），遮罩一变就要重新
-///     合成一次。
-///
-/// 默认配置下可见的是 backdrop 那条（`dynamicColor` 默认 YES），也就是说原来每一个
-/// 部件每 tick 都在**额外**触发一次完整的 Auto Layout，画在一个没人看得见的 label 上。
-///
-/// 两条都不可见时（这个部件被设成只在另一个朝向显示）退到写 `maskLabel`：它不在
-/// Auto Layout 引擎里（它只是 backdropView 的 maskView，没有任何约束），而
-/// backdropView 隐藏时遮罩根本不会被合成 —— 所以这一次几乎不要钱，又能保证转回该
-/// 朝向时文本是新的。
+/// 缓存仍然有效：稳态里（时间、日期、信号格这些静的部件）两条路径的写入都会被
+/// 内容比对跳过，省下的排版与 0.26 相同。
 - (void) updateLabel:(UILabel *) label updateMaskLabel:(UILabel *) maskLabel backdropView:(AnyBackdropView *) backdropView identifiers:(NSArray *) identifiers fontSize:(double) fontSize autoResizes:(BOOL) autoResizes width:(CGFloat) width height:(CGFloat) height properties:(NSDictionary *) properties
 {
 #if DEBUG
     os_log_debug(OS_LOG_DEFAULT, "updateLabel");
 #endif
-    UILabel *live;
-    if (!backdropView.hidden && !maskLabel.hidden) {
-        live = maskLabel;
-    } else if (!label.hidden) {
-        live = label;
-    } else {
-        live = maskLabel;
-        // 转回该朝向时真正会显示的是 label（如果用户把自适应取色关了），必须重新
-        // 画，不能拿旧文本凑合。这里没写它，就把它的缓存作废。
-        objc_setAssociatedObject(label, kHeliumLastAttributedTextKey, nil,
-                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
-
     NSAttributedString *attributedText = formattedAttributedString(identifiers, fontSize, label.textColor, [self apiKey], [self dateLocale]);
     if (!attributedText) {
         helium_dbg(@"updateLabel: formattedAttributedString returned NIL (tick happened!)");
         return;
     }
 
-    // 内容一个字都没变就整个跳过。
-    //
-    // `setAttributedText:` **无条件**把 label 标成需要重画，CoreText 于是从头排一遍版
-    // —— 每个 widget 每秒两次（正文一次、作为 `maskView` 的 maskLabel 再一次），
-    // 哪怕文本逐字节相同。状态栏上真正每秒都在动的只有 CPU 占用、温度那几个数字；
-    // 时间、日期、运营商、信号格这些是静的，跳过它们等于把常驻 HUD 稳态里最大的一块
-    // 排版开销直接砍掉。
-    //
-    // 比较放在 `setAttributedText:` **之前**，代价是一次很短的字符串加属性字典比对，
-    // 比它省下的那次排版便宜几个数量级；没命中也只是白比一次。
-    //
-    // 缓存挂在**实际被写的那一个** label 上（见 `kHeliumLastAttributedTextKey`）：
-    // 两条路径各有各的缓存，谁可见就只维护谁。
-    NSAttributedString *drawn = objc_getAssociatedObject(live, kHeliumLastAttributedTextKey);
-    if (drawn && [drawn isEqualToAttributedString: attributedText]) {
-        // 0.29 诊断：缓存命中也要留痕 —— 否则稳态下（文本不变、全部命中）日志里
-        // 看起来像「tick 根本没发生」，会误导诊断。
-        helium_dbg(@"updateLabel: cache hit on %@, skip draw", live == label ? @"label" : @"maskLabel");
-        if (autoResizes) {
-            // `sizeThatFits:` 的结果只取决于文本，文本没变尺寸就没变。
+    // 内容一个字都没变就跳过对应 label 的写入（0.26 引入、保留）。
+    // 比较放在 `setAttributedText:` 之前，代价是一次很短的字符串加属性字典比对，
+    // 比它省下的那次 CoreText 排版便宜几个数量级。
+    NSAttributedString *labelDrawn = objc_getAssociatedObject(label, kHeliumLastAttributedTextKey);
+    BOOL labelChanged = !(labelDrawn && [labelDrawn isEqualToAttributedString: attributedText]);
+    NSAttributedString *maskDrawn = objc_getAssociatedObject(maskLabel, kHeliumLastAttributedTextKey);
+    BOOL maskChanged = !(maskDrawn && [maskDrawn isEqualToAttributedString: attributedText]);
+
+    if (!labelChanged && !maskChanged) {
+        // `autoResizes == NO` 时 frame 是按设置里的宽高**显式**写的，那个值可能在
+        // 两次调用之间被改过，所以这里还要再比一次尺寸。
+        if (autoResizes || CGSizeEqualToSize(maskLabel.frame.size, CGSizeMake(width, height))) {
+            helium_dbg(@"updateLabel: cache hit (label=%d mask=%d), skip", labelChanged, maskChanged);
             return;
         }
-        // `autoResizes == NO` 时 frame 是按设置里的宽高**显式**写的，那个值可能在两次
-        // 调用之间被改过（用户在设置里调了缩放），所以这里还要再比一次尺寸。
-        if (CGSizeEqualToSize(maskLabel.frame.size, CGSizeMake(width, height)))
-            return;
     }
-    objc_setAssociatedObject(live, kHeliumLastAttributedTextKey, attributedText,
-                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
-    // NSLog(@"boom attr:%@", attributedText);
-    helium_dbg(@"updateLabel draw: live=%@ bg=%d mask=%d label=%d text=\"%@\"",
-               live == label ? @"label" : @"maskLabel",
-               backdropView.hidden, maskLabel.hidden, label.hidden,
-               [attributedText string]);
-    [live setAttributedText: attributedText];
+    if (labelChanged) {
+        objc_setAssociatedObject(label, kHeliumLastAttributedTextKey, attributedText,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        // **hidden 也要写**：这个写入触发的全树布局是 maskLabel 内容上屏的
+        // 驱动器之一（见方法头注释）—— 0.26 恰恰是把这条「白写的路径」当成了
+        // 纯浪费删掉，才有了「部件要调一次设置才显示」。
+        [label setAttributedText: attributedText];
+    }
+    if (maskChanged) {
+        objc_setAssociatedObject(maskLabel, kHeliumLastAttributedTextKey, attributedText,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        [maskLabel setAttributedText: attributedText];
+        // maskView 不在视图层级里，显示管线不保证处理它 —— 显式驱动一次，
+        // 不再依赖「写 hidden 的 label」那个布局副作用的时机。
+        [maskLabel.layer setNeedsDisplay];
+        [maskLabel.layer displayIfNeeded];
+    }
+    helium_dbg(@"updateLabel draw: labelChanged=%d maskChanged=%d bg=%d text=\"%@\"",
+               labelChanged, maskChanged, backdropView.hidden, [attributedText string]);
 
-    // 尺寸一律写在 `maskLabel` 上，不管刚才文本写进了谁 —— 这是原来就有的行为，
-    // 不能改：`label` 上有 `updateViewConstraints` 建的宽高约束，直接给它写 frame
-    // 会跟 Auto Layout 打架（下一轮 layout 会把 frame 覆盖回去）。
+    // 尺寸一律写在 `maskLabel` 上（原有行为，不能改：`label` 上有
+    // `updateViewConstraints` 建的宽高约束，直接写 frame 会跟 Auto Layout 打架）。
     if (autoResizes) {
         [self useSizeThatFitsZeroWithLabel:maskLabel];
     } else {

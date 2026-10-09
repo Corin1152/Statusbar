@@ -16,6 +16,8 @@ NS_ASSUME_NONNULL_BEGIN
 /// 把这三步整个跑两遍 —— 其中 `updateViewConstraints` 要 deactivate/activate
 /// 全部 ~6N 条约束。这里做一个 200 ms 的去重窗口，比赌哪一条注册路径更可靠要稳。
 - (void)performReload;
+/// 画第 i 个 widget set 的当前帧（定时器 tick 与启动首帧共用，见 .mm 的说明）。
+- (void)drawWidgetSetAtIndex:(int)i;
 @end
 
 NS_ASSUME_NONNULL_END
