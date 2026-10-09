@@ -21,6 +21,33 @@
 #define NOTIFY_UI_LOCKSTATE    "com.apple.springboard.lockstate"
 #define NOTIFY_LS_APP_CHANGED  "com.apple.LaunchServices.ApplicationsChanged"
 
+#pragma mark - Diagnostic log (0.29)
+
+/// 「启用 HUD 后部件要手动调一次设置才出现」的根因到现在还没定位到 —— 这份日志就
+/// 是为它准备的：把启动、reload、定时器建立、每次渲染写入的全部决策点按时间轴落到
+/// 文件里，用户复现一次后拿回来对表。定位完成后整段移除。
+///
+/// 追加写 `/var/mobile/Library/Preferences/helium_hud_debug.log`：HUD 是 root + 
+/// no-sandbox，写这里没有沙盒问题；mobile 侧也能读，Filza 直接可以看。每次调用
+/// 单独 fopen/fclose，代价是每条一次 open，换来「绝不丢日志」—— 诊断优先。
+static CFAbsoluteTime gHeliumLogStart = 0;
+
+static void helium_dbg(NSString *fmt, ...)
+{
+    FILE *f = fopen("/var/mobile/Library/Preferences/helium_hud_debug.log", "a");
+    if (!f)
+        return;
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (gHeliumLogStart == 0.0)
+        gHeliumLogStart = now;
+    va_list args;
+    va_start(args, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:args];
+    va_end(args);
+    fprintf(f, "[t+%.3f] %s\n", now - gHeliumLogStart, msg.UTF8String);
+    fclose(f);
+}
+
 /// 上一次真正画上去的文本，挂在**当时可见的那个** label 上。
 ///
 /// **为什么挂在 label 上而不是存成 ivar**：`createWidgetSetsView` 会把这一整套
@@ -81,10 +108,12 @@ static void SpringBoardLockStatusChanged
         BOOL isPasscodeSet;
         SBGetScreenLockStatus(sbsPort, &isLocked, &isPasscodeSet);
 
+        helium_dbg(@"lockstate: locked=%d", isLocked);
         if (!isLocked)
         {
             [rootViewController.view setHidden:NO];
             [rootViewController resumeLoopTimer];
+            helium_dbg(@"unlock: view unhidden + timers resumed");
         }
         else
         {
@@ -182,18 +211,30 @@ static CFAbsoluteTime gLastReloadStamp = 0;
     // `viewDidLoad` 之前视图数组还是空的（init 只建了容器），而 plist 里的部件配置
     // 非空 —— 此时跑 `reloadUserDefaults` 会对空数组 `objectAtIndex:` 越界。直接跳过：
     // `viewDidLoad` 末尾会**同步**补上这一次 reload，见那里的说明。
-    if (!_contentView)
+    if (!_contentView) {
+        helium_dbg(@"performReload skipped: no contentView yet");
         return;
+    }
 
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
     if (now - gLastReloadStamp < 0.2) {
+        helium_dbg(@"performReload deduped (<200ms since last)");
         return;   // 同一份设置的第二份投递，忽略
     }
     gLastReloadStamp = now;
 
+    {
+        NSDictionary *attrs = [[NSFileManager defaultManager]
+                               attributesOfItemAtPath:USER_DEFAULTS_PATH error:nil];
+        helium_dbg(@"performReload begin: plist size=%llu mtime=%.1f",
+                   (unsigned long long)attrs.fileSize,
+                   attrs.modificationDate.timeIntervalSince1970);
+    }
+
     [self reloadUserDefaults];
     [self resetLoopTimer];
     [self updateViewConstraints];
+    helium_dbg(@"performReload done");
 }
 
 - (void) reloadUserDefaults
@@ -211,6 +252,7 @@ static CFAbsoluteTime gLastReloadStamp = 0;
     }
 
     NSArray *widgetProps = [self widgetProperties];
+    helium_dbg(@"reloadUserDefaults: %lu widget sets", (unsigned long)[widgetProps count]);
     for (int i = 0; i < [widgetProps count]; i++) {
         UIVisualEffectView *blurView = [_blurViews objectAtIndex:i];
         UILabel *labelView = [_labelViews objectAtIndex:i];
@@ -238,6 +280,15 @@ static CFAbsoluteTime gLastReloadStamp = 0;
         UIFont *textFont = [FontUtils loadFontWithName:fontName size: getDoubleFromDictKey(properties, @"fontSize", 10) bold: getBoolFromDictKey(properties, @"textBold") italic: getBoolFromDictKey(properties, @"textItalic")];
         double textAlpha = getDoubleFromDictKey(properties, @"textAlpha", 1.0);
         BOOL dynamicColor = getBoolFromDictKey(properties, @"dynamicColor", true);
+
+        // 0.29 诊断：把每个 set 的关键决策全部记下来。最想看的是 isEnabled ——
+        // 「完全不显示」在代码上唯一可能的形态就是它被读成 NO。
+        helium_dbg(@"set%d: enabled=%d dynamic=%d interval=%.2f ids=%lu orient=%ld",
+                   i, getBoolFromDictKey(properties, @"isEnabled"),
+                   dynamicColor,
+                   getDoubleFromDictKey(properties, @"updateInterval", 1.0),
+                   (unsigned long)[[properties objectForKey: @"widgetIDs"] ?: @[] count],
+                   (long)orientationMode);
 
         // 自适应取色那条路径的两个旋钮。它们只影响成本、不影响可读性（见 AnyBackdropView
         // 里 `_colorFilters` 的说明），所以直接推给 backdrop 就行 —— 它自己会在值真的
@@ -367,6 +418,7 @@ static CFAbsoluteTime gLastReloadStamp = 0;
             });
         }];
         [self registerNotifications];
+        helium_dbg(@"HUDRootViewController init (pid %d)", getpid());
     }
     return self;
 }
@@ -380,7 +432,8 @@ static CFAbsoluteTime gLastReloadStamp = 0;
 
 - (void) viewDidLoad
 {
-    [super viewDidLoad];    
+    [super viewDidLoad];
+    helium_dbg(@"viewDidLoad begin");
     // MARK: Main Content View
     _contentView = [[UIView alloc] init];
     _contentView.backgroundColor = [UIColor clearColor];
@@ -402,9 +455,26 @@ static CFAbsoluteTime gLastReloadStamp = 0;
     [_contentView addSubview:_verticalLine];
 
     [self createWidgetSetsView];
+    helium_dbg(@"viewDidLoad views created: blur=%lu label=%lu backdrop=%lu mask=%lu",
+               (unsigned long)_blurViews.count, (unsigned long)_labelViews.count,
+               (unsigned long)_backdropViews.count, (unsigned long)_maskLabelViews.count);
     // Publish this HUD's CPU readings to the shared file so SysProbe can show the
     // same numbers instead of sampling on its own (see CPUMetricsPublisher.mm).
     helium_start_cpu_metrics_publisher();
+    // 启动兜底（0.29）：「部件要手动调一次设置才出现」的根因还没定位（本版日志就
+    // 是为它准备的），在那之前先用笨办法兜住 —— 启动后把同一次 reload 再补跑两遍。
+    // performReload 幂等（去重窗口只拦 200ms 内的重跑），多跑的代价是几次 plist 读
+    // 与约束重挂，相对换来的「开 HUD 就有显示」可以忽略。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        helium_dbg(@"boot fallback reload @1s");
+        [self performReload];
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        helium_dbg(@"boot fallback reload @3s");
+        [self performReload];
+    });
     // 启动时的初始化 reload **同步**跑掉，不再依赖通知投递的时机。
     //
     // 通知是异步的：`notify_post` 之后两份投递（dispatch block 与 CF 回调）要等
@@ -414,6 +484,7 @@ static CFAbsoluteTime gLastReloadStamp = 0;
     // 启动时的一次没有）。同步调用之后，随后的通知投递要么被 200 ms 去重窗口吞掉
     // （内容相同，无害），要么作为一次幂等重跑。
     [self performReload];
+    helium_dbg(@"viewDidLoad sync performReload done");
     notify_post(NOTIFY_RELOAD_HUD);
 }
 
@@ -459,6 +530,7 @@ static CFAbsoluteTime gLastReloadStamp = 0;
         float height = getDoubleFromDictKey(properties, @"scaleY", 12.0);
         NSString *timerName = [NSString stringWithFormat:@"widgetset%d", i];
         if (isEnabled) {
+            helium_dbg(@"set%d: timer built (interval %.2f)", i, updateInterval);
             [[EZTimer shareInstance] timer:timerName timerInterval:updateInterval leeway:0.1 resumeType:EZTimerResumeTypeNow queue:EZTimerQueueTypeConcurrent queueName:@"update" repeats:YES action:^(NSString *name) {
                 dispatch_sync(dispatch_get_main_queue(), ^{
                     [self updateLabel: labelView updateMaskLabel: maskLabelView backdropView: backdropView identifiers: identifiers fontSize: fontSize autoResizes: autoResizes width: width height: height properties: properties];
@@ -471,25 +543,9 @@ static CFAbsoluteTime gLastReloadStamp = 0;
             [backdropView setHidden:YES];
             [maskLabelView setHidden:YES];
             [[EZTimer shareInstance] cancel:timerName];
+            helium_dbg(@"set%d: disabled, timer cancelled", i);
         }
     }
-}
-
-/// 描边色：按**亮度**在纯黑 / 纯白之间二选一，而不是做分量取反。
-///
-/// 分量取反在中间灰上会得到它自己（0.5 → 0.5），等于没描边 —— 而那恰好是最需要兜底的
-/// 一档背景。按亮度二选一则在两端都给最大反差：白字配黑边、黑字配白边。
-static UIColor *HeliumOutlineColorForTextColor(UIColor *textColor)
-{
-    CGFloat r = 0.0, g = 0.0, b = 0.0, a = 1.0;
-    if (![textColor getRed:&r green:&g blue:&b alpha:&a]) {
-        // 非 RGB 色彩空间（灰度色、pattern / dynamic 色）取不到分量，退到黑边：
-        // 默认字色是白，这也是最常见的那一档。
-        return [UIColor blackColor];
-    }
-    // 与颜色滤镜同一套 Rec.709 权重，保证和自适应那条路的判断口径一致。
-    CGFloat luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-    return luma > 0.5 ? [UIColor blackColor] : [UIColor whiteColor];
 }
 
 /// 缓存键 `kHeliumLastAttributedTextKey` 声明在文件开头，见那里的说明。
@@ -535,35 +591,9 @@ static UIColor *HeliumOutlineColorForTextColor(UIColor *textColor)
     }
 
     NSAttributedString *attributedText = formattedAttributedString(identifiers, fontSize, label.textColor, [self apiKey], [self dateLocale]);
-    if (!attributedText)
+    if (!attributedText) {
+        helium_dbg(@"updateLabel: formattedAttributedString returned NIL (tick happened!)");
         return;
-
-    // 关掉自适应取色时，给字形加一圈**反色描边**。
-    //
-    // 自适应取色开着的时候填充色是被背后画面反过来的（见 AnyBackdropView），一定看得
-    // 见；关掉之后填充色由用户自己挑，可能正好落在背景上 —— 白字白底就彻底没了。
-    // 描边是这条路径的兜底：填充与描边互为反色，任何背景上至少有一个是显眼的。
-    //
-    // 只在 `live == label`（也就是自适应取色关着的那条路径）上加：自适应那条路本身
-    // 已经把背后压成纯黑 / 纯白再翻过来，再加描边纯属白花钱。
-    //
-    // 注意描边是加在**最终字符串**上的，所以它天然进了下面那次缓存比对 —— 开关一变，
-    // 文本就真的变了，缓存自动失效，不需要额外作废。
-    if (live == label && getBoolFromDictKey(properties, @"textStroke", true)) {
-        double strokeWidth = getDoubleFromDictKey(properties, @"textStrokeWidth", 3.0);
-        if (strokeWidth > 0.0) {
-            NSMutableAttributedString *stroked = [attributedText mutableCopy];
-            NSRange all = NSMakeRange(0, stroked.length);
-            [stroked addAttribute:NSStrokeColorAttributeName
-                            value:HeliumOutlineColorForTextColor(label.textColor)
-                            range:all];
-            // `NSStrokeWidthAttributeName` 的单位是**字号百分比**。负值 = 描边 + 填充；
-            // 正值只描边，字心会变空。
-            [stroked addAttribute:NSStrokeWidthAttributeName
-                            value:@(-strokeWidth)
-                            range:all];
-            attributedText = stroked;
-        }
     }
 
     // 内容一个字都没变就整个跳过。
@@ -581,6 +611,9 @@ static UIColor *HeliumOutlineColorForTextColor(UIColor *textColor)
     // 两条路径各有各的缓存，谁可见就只维护谁。
     NSAttributedString *drawn = objc_getAssociatedObject(live, kHeliumLastAttributedTextKey);
     if (drawn && [drawn isEqualToAttributedString: attributedText]) {
+        // 0.29 诊断：缓存命中也要留痕 —— 否则稳态下（文本不变、全部命中）日志里
+        // 看起来像「tick 根本没发生」，会误导诊断。
+        helium_dbg(@"updateLabel: cache hit on %@, skip draw", live == label ? @"label" : @"maskLabel");
         if (autoResizes) {
             // `sizeThatFits:` 的结果只取决于文本，文本没变尺寸就没变。
             return;
@@ -594,6 +627,10 @@ static UIColor *HeliumOutlineColorForTextColor(UIColor *textColor)
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
     // NSLog(@"boom attr:%@", attributedText);
+    helium_dbg(@"updateLabel draw: live=%@ bg=%d mask=%d label=%d text=\"%@\"",
+               live == label ? @"label" : @"maskLabel",
+               backdropView.hidden, maskLabel.hidden, label.hidden,
+               [attributedText string]);
     [live setAttributedText: attributedText];
 
     // 尺寸一律写在 `maskLabel` 上，不管刚才文本写进了谁 —— 这是原来就有的行为，

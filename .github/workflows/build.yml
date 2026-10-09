@@ -99,14 +99,32 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: statusbar-${{ github.run_number }}
-          name: Statusbar 0.28 (build ${{ github.run_number }})
+          name: Statusbar 0.29 (build ${{ github.run_number }})
           body: |
-            基于 Helium 改版。应用名改为 Statusbar，版本从 0.01 起（本次 0.28）。
+            基于 Helium 改版。应用名改为 Statusbar，版本从 0.01 起（本次 0.29）。
 
             界面：只有「首页 / 自定义」两页，首页右上角直接显示版本号（无齿轮/设置入口）。
             部件：原有 9 个 + CPU温度 / CPU占用 / CPU频率 / 蜂窝信号（RSRP）。
 
-            本次改动（0.28：修复 0.26/0.27 真机「启用 HUD 部件不显示」，感谢用户的崩溃日志定位）：
+            本次改动（0.29：移除文字描边 + 启动显示兜底 + 诊断日志）：
+
+              · 移除「文字描边」：真机观感不佳（可见度不高），按反馈整段删掉 ——
+                设置项、渲染逻辑、文案全部移除。关掉自适应取色后文字看不见的话，
+                直接换个字色即可。
+
+              · 启动显示兜底：「启用 HUD 后部件要手动调一次设置才出现」在 0.28 的
+                同步 reload 之后仍然存在，根因还没定位到。0.29 在启动后 1s / 3s
+                各补跑一次幂等的 reload（就是「手动调设置」触发的那条路径），先用
+                笨办法保证「开 HUD 就有显示」。
+
+              · 诊断日志：把启动、reload、定时器建立、每次渲染写入的全部决策点按
+                时间轴写到
+                /var/mobile/Library/Preferences/helium_hud_debug.log
+                （追加写，Filza 可直接查看）。复现一次「不显示」后把这份文件发回
+                来，就能对出第一次 reload 与「调设置的那次」差在哪。
+
+              · 0.28 的崩溃修复（压缩滤镜的 inputKeys）保持不变；0.28 真机确认
+                打开压缩滤镜不再崩溃。
 
               · 修复启动崩溃 —— 部件全部消失的直接原因。0.27 的压缩滤镜在可用性
                 检查里直接调用了 CAFilter 的私有方法 `inputKeys`，真机（iOS 16.5）

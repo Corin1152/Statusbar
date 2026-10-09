@@ -44,8 +44,6 @@ struct EditWidgetSetView: View {
     @State var dynamicColor: Bool = true
     
     // MARK: Adaptive-color / readability knobs (see WidgetSetStruct)
-    @State var textStroke: Bool = true
-    @State var textStrokeWidth: Double = 3.0
     @State var blurRadius: Double = 50.0
     @State var useCompressedFilters: Bool = false
     
@@ -275,34 +273,6 @@ struct EditWidgetSetView: View {
                                 ColorPicker(NSLocalizedString("Set Text Color", comment: ""), selection: $customColor)
                                     .labelsHidden()
                                     .onChange(of: customColor) { _ in
-                                        changesMade = true
-                                    }
-                            }
-                        }
-                        // MARK: Text Outline
-                        // 自适应取色关掉之后颜色由用户自己挑，可能正好落在背景上 —— 白字白底
-                        // 就彻底看不见了。描边是这条路径的兜底：填充与描边互为反色，任何背景
-                        // 上至少有一个是显眼的。
-                        HStack {
-                            Toggle(isOn: $textStroke) {
-                                Text(NSLocalizedString("Text Outline", comment: ""))
-                                    .bold()
-                                    .minimumScaleFactor(0.5)
-                            }
-                            .onChange(of: textStroke) { _ in
-                                changesMade = true
-                            }
-                        }
-                        if textStroke {
-                            // MARK: Outline Width
-                            VStack {
-                                HStack {
-                                    Text(NSLocalizedString("Outline Width", comment: ""))
-                                        .bold()
-                                    Spacer()
-                                }
-                                BetterSlider(value: $textStrokeWidth, bounds: 0.5...8.0)
-                                    .onChange(of: textStrokeWidth) { _ in
                                         changesMade = true
                                     }
                             }
@@ -589,8 +559,6 @@ struct EditWidgetSetView: View {
                 usesCustomColor = widgetSet.colorDetails.usesCustomColor
                 customColor = Color(widgetSet.colorDetails.color)
                 
-                textStroke = widgetSet.textStroke
-                textStrokeWidth = widgetSet.textStrokeWidth
                 blurRadius = widgetSet.blurRadius
                 useCompressedFilters = widgetSet.useCompressedFilters
                 
@@ -664,8 +632,6 @@ struct EditWidgetSetView: View {
                 color: UIColor(customColor)
             ),
             
-            textStroke: textStroke,
-            textStrokeWidth: textStrokeWidth,
             blurRadius: blurRadius,
             useCompressedFilters: useCompressedFilters,
             

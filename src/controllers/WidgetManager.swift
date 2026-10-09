@@ -102,18 +102,6 @@ struct WidgetSetStruct: Identifiable, Equatable {
     
     // MARK: Adaptive-color / readability knobs
     
-    /// 关掉自适应取色时，给字形加一圈**反色描边**。
-    ///
-    /// 自适应取色开着的时候，文字颜色是被背后画面反过来的（见 `AnyBackdropView`），
-    /// 所以一定看得见；关掉之后颜色由用户自己挑，可能正好落在背景上 —— 白字白底就
-    /// 彻底没了。描边是这条路径上的兜底：填充和描边互为反色，任何背景上至少有一个
-    /// 是显眼的。只在这一条路径上生效，自适应那条路加了纯属白花钱。
-    var textStroke: Bool = true
-    
-    /// 描边宽度，单位是**字号百分比**（`NSStrokeWidthAttributeName` 的语义），
-    /// 运行时取负值用（正值只描边、字心是空的）。
-    var textStrokeWidth: Double = 3.0
-    
     /// 自适应取色那条路径的高斯模糊半径（pt）。
     /// 只决定取色决定在空间上有多平滑，**与可读性无关**，所以降它只会省钱不会伤可读性。
     var blurRadius: Double = 50.0
@@ -209,8 +197,6 @@ class WidgetManager: ObservableObject {
                     blurDetails: blurDetailsStruct,
                     
                     dynamicColor: s["dynamicColor"] as? Bool ?? true,
-                    textStroke: s["textStroke"] as? Bool ?? true,
-                    textStrokeWidth: s["textStrokeWidth"] as? Double ?? 3.0,
                     blurRadius: s["blurRadius"] as? Double ?? 50.0,
                     useCompressedFilters: s["useCompressedFilters"] as? Bool ?? false,
                     fontName: s["fontName"] as? String ?? "System Font",
@@ -277,8 +263,6 @@ class WidgetManager: ObservableObject {
             ]
             wSet["colorDetails"] = colorDetails
             
-            wSet["textStroke"] = s.textStroke
-            wSet["textStrokeWidth"] = s.textStrokeWidth
             wSet["blurRadius"] = s.blurRadius
             wSet["useCompressedFilters"] = s.useCompressedFilters
             
@@ -415,8 +399,6 @@ class WidgetManager: ObservableObject {
             ),
             
             dynamicColor: true,
-            textStroke: true,
-            textStrokeWidth: 3.0,
             blurRadius: 50.0,
             useCompressedFilters: false,
             fontName: "System Font",
@@ -458,8 +440,6 @@ class WidgetManager: ObservableObject {
                 widgetSets[i].dynamicColor = ns.dynamicColor
                 widgetSets[i].colorDetails = ns.colorDetails
                 
-                widgetSets[i].textStroke = ns.textStroke
-                widgetSets[i].textStrokeWidth = ns.textStrokeWidth
                 widgetSets[i].blurRadius = ns.blurRadius
                 widgetSets[i].useCompressedFilters = ns.useCompressedFilters
                 
