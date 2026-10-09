@@ -178,14 +178,43 @@ static NSAttributedString* formattedAttributedSpeedString(BOOL isUp, NSInteger s
 }
 
 #pragma mark - Battery Temp Widget
+/*
+ 一次重绘里这个函数会被问到很多次：设备温度（3）、电池详情（4）、电量百分比（7）、
+充电符号（8）四个部件都要同一份 `IOPMPowerSource` 属性。原来每次都是
+`IOServiceGetMatchingService` + `IORegistryEntryCreateCFProperties` —— 两次 IOKit
+往返 —— 于是一个 tick 里同一份数据可能被取四五遍。
+
+0.25 s 的缓存足够覆盖一次重绘（`updateInterval` 最小 0.01 s，但那种配置下用户本来
+就只要这一份），又短到插拔电源不会被察觉。
+*/
 NSDictionary* getBatteryInfo()
 {
+    static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
+    static NSDictionary *cached = nil;
+    static CFAbsoluteTime stamp = 0;
+
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+
+    os_unfair_lock_lock(&lock);
+    if (cached && (now - stamp) < 0.25) {
+        NSDictionary *hit = cached;
+        os_unfair_lock_unlock(&lock);
+        return hit;
+    }
+    os_unfair_lock_unlock(&lock);
+
     CFDictionaryRef matching = IOServiceMatching("IOPMPowerSource");
     io_service_t service = IOServiceGetMatchingService(kIOMasterPortDefault, matching);
     CFMutableDictionaryRef prop = NULL;
     IORegistryEntryCreateCFProperties(service, &prop, NULL, 0);
     NSDictionary* dict = (__bridge_transfer NSDictionary*)prop;
     IOObjectRelease(service);
+
+    os_unfair_lock_lock(&lock);
+    cached = dict;
+    stamp = CFAbsoluteTimeGetCurrent();
+    os_unfair_lock_unlock(&lock);
+
     return dict;
 }
 
@@ -904,9 +933,101 @@ static double readHIDSensorTemperature(NSString **outName, NSMutableArray *dumpO
     return best;
 }
 
+// MARK: - CPU temperature, sampled off the render path
+
+/*
+ 和上面 CPU 频率那一段完全同构，理由也一样 —— 而且更硬。
+
+`getCPUDieTemperature()` 的快速路径（`gHIDWorks` 已经为真之后）要**枚举所有**
+AppleVendor 温度服务，每个服务两次 IOKit 往返（`CopyProperty("Product")` +
+`CopyEvent`）。A11 上这类传感器有几十个。这是一次同步的 IOKit 枚举，而它原来跑在
+**渲染路径（主线程）**上，每个 tick 一次。
+
+旁边频率那一段专门写了注释说「那件事绝不能发生在 HUD 的渲染路径上」—— 而温度比
+频率更重：频率是纯算术 + 一个忙循环，温度是几十次内核往返。
+
+现在改成同一个形状：formatter 只读缓存；缓存过期就丢一次异步采样到自己的串行队列
+上。温度本身变化慢，1 s 的采样窗足够。渲染路径从此一次 IOKit 都不碰。
+
+（和频率一样，采样是**自限速**的：只有真的有部件在显示它，`formattedCPUTemp` 才会
+被调到，才会去问缓存。没有温度部件时这里一次都不会跑。）
+*/
+
+/// 缓存的摄氏温度；NAN = 「还没有读数」。
+static double gCPUTempCached = NAN;
+static CFAbsoluteTime gCPUTempStamp = 0;
+static BOOL gCPUTempSampling = NO;
+
+/// 保护上面三个。**不**保护 `gCPUTempCached` 的读取语义之外的东西 ——
+/// 读它也要持锁，因为 double 的读写在 32 位对齐下并不保证原子，而它确实会被
+/// 后台队列写、被主线程读。
+static os_unfair_lock gCPUTempLock = OS_UNFAIR_LOCK_INIT;
+
+/// 一次采样能用多久。温度变化慢，而 `getCPUDieTemperature()` 内部还有自己的
+/// 探针预算与 30 次失败退避，所以这个值只是「最快多久问一次」。
+#define CPU_TEMP_SAMPLE_SECONDS 1.0
+
+static dispatch_queue_t cpuTempQueue(void)
+{
+    static dispatch_once_t once;
+    static dispatch_queue_t queue = NULL;
+    dispatch_once(&once, ^{
+        queue = dispatch_queue_create("com.leemin.helium.cputemp", DISPATCH_QUEUE_SERIAL);
+    });
+    return queue;
+}
+
+/// 缓存过期就丢一次采样，立刻返回。
+static void cpuTempScheduleIfStale(void)
+{
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+
+    os_unfair_lock_lock(&gCPUTempLock);
+    BOOL first = (gCPUTempStamp == 0.0);
+    BOOL stale = (!gCPUTempSampling && (now - gCPUTempStamp) >= CPU_TEMP_SAMPLE_SECONDS);
+    if (stale) {
+        gCPUTempSampling = YES;
+    }
+    os_unfair_lock_unlock(&gCPUTempLock);
+
+    if (!stale) {
+        return;
+    }
+
+    if (first) {
+        // 开机后第一次同步取。
+        //
+        // 这一次原来是必然要走完整探针的（`gHIDWorks` 还是 NO，先枚举 HID、再按组
+        // 试 IOReport），所以它本来就慢；挪到后台只会让部件先闪一下「??ºC」。为
+        // 了不引入这个可见回归，第一次留在原地同步做掉 —— 之后就全在后台了。
+        double t = getCPUDieTemperature();
+        os_unfair_lock_lock(&gCPUTempLock);
+        gCPUTempCached = t;
+        gCPUTempStamp = CFAbsoluteTimeGetCurrent();
+        gCPUTempSampling = NO;
+        os_unfair_lock_unlock(&gCPUTempLock);
+        return;
+    }
+
+    dispatch_async(cpuTempQueue(), ^{
+        double t = getCPUDieTemperature();
+        os_unfair_lock_lock(&gCPUTempLock);
+        gCPUTempCached = t;
+        gCPUTempStamp = CFAbsoluteTimeGetCurrent();
+        gCPUTempSampling = NO;
+        os_unfair_lock_unlock(&gCPUTempLock);
+    });
+}
+
 static NSString* formattedCPUTemp(BOOL useFahrenheit)
 {
-    double temp = getCPUDieTemperature();
+    // 永远不阻塞渲染路径：问一下要不要补采样，然后报上一次的结果。
+    cpuTempScheduleIfStale();
+
+    os_unfair_lock_lock(&gCPUTempLock);
+    double temp = gCPUTempCached;
+    os_unfair_lock_unlock(&gCPUTempLock);
+
     if (isnan(temp)) {
         return useFahrenheit ? @"??ºF" : @"??ºC";
     }
@@ -1128,6 +1249,17 @@ static uint64_t gCPUFrequencyKHz = 0;
 static CFAbsoluteTime gCPUFrequencyStamp = 0;
 static BOOL gCPUFrequencySampling = NO;
 
+/// 上一次有部件**真的把这个数画到屏幕上**的时间。
+///
+/// 发布器（`CPUMetricsPublisher.mm`）用它决定要不要烧探针。理由：探针是 2 个性能核
+/// 各约 62 ms 的忙循环，而且线程 QoS 是 `QOS_CLASS_USER_INTERACTIVE` —— 它会**抢占
+/// 前台**。原来发布器每秒无条件 kick 一次，于是哪怕 HUD 上一个 CPU 频率部件都没有，
+/// 每 5 秒也照样来一次双性能核饱和；在 2 + 4 的 A11 上那就是肉眼可见的周期性掉帧。
+///
+/// 10 秒的窗口：比探针自己的 5 秒节流宽一倍，所以部件在屏幕上时它永远为真，不会
+/// 因为一次重绘的抖动就误判成「没人看」。
+static CFAbsoluteTime gCPUFrequencyWantedStamp = 0;
+
 /// Guards the `gCPUFrequencySampling` / `gCPUFrequencyStamp` pair and the
 /// check-then-act in `cpuFrequencyScheduleIfStale` below. **Not** the read of
 /// `gCPUFrequencyKHz` — see the paragraph above: an aligned 64-bit load is atomic on
@@ -1214,6 +1346,9 @@ static void cpuFrequencyScheduleIfStale(void)
 /// asynchronous), which is the same behaviour as before.
 static NSString* formattedCPUFrequency(NSInteger unit)
 {
+    // 有部件在问，就记一笔「有人在看」—— 发布器据此决定要不要继续烧探针。
+    gCPUFrequencyWantedStamp = CFAbsoluteTimeGetCurrent();
+
     // Never block the render path: ask for a fresh sample if the cache is stale,
     // then report whatever the last one produced.
     cpuFrequencyScheduleIfStale();
@@ -1277,6 +1412,16 @@ extern "C" uint64_t HeliumCPUFrequencyKHz(void)
 extern "C" void HeliumCPUFrequencyKick(void)
 {
     cpuFrequencyScheduleIfStale();
+}
+
+/// 最近 10 秒内有没有部件真的画过 CPU 频率。
+///
+/// 发布器用它给探针做门控：没人显示这个数的时候就不测了。SysProbe 那边不受影响 ——
+/// 它读共享文件，读不到（或读到 `freq_mhz: 0`）会回落到它自己的采样，本来就有这条
+/// 降级路径（见 SysProbe 的 `CPUSharedMetrics.swift`）。
+extern "C" BOOL HeliumCPUFrequencyWidgetInUse(void)
+{
+    return (CFAbsoluteTimeGetCurrent() - gCPUFrequencyWantedStamp) < 10.0;
 }
 
 // MARK: - Cellular signal (RSRP)
@@ -1549,6 +1694,40 @@ static NSString* formattedChargingSymbol(BOOL filled)
     return @"";
 }
 
+/// 取（并缓存）充电符号那张已经染好色的位图。
+///
+/// `imageWithTintColor:` 是实打实的栅格化，而 `formatParsedInfo` 原来每个 tick 都
+/// 重新走一遍「systemImageNamed: + configurationWithPointSize: + imageWithTintColor:」
+/// 再造一个 `NSTextAttachment`。名字、字号、颜色三者相同就是同一张图。
+///
+/// 缓存有上界（16）：字号和颜色是用户可改的，改一次就多一个键；上界到了就不再往里
+/// 放，只是退化成「不缓存」，不会一直涨。
+static UIImage *chargingSymbolImage(NSString *name, double fontSize, UIColor *textColor)
+{
+    static NSMutableDictionary<NSString *, UIImage *> *cache = nil;
+    static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
+
+    NSString *key = [NSString stringWithFormat:@"%@|%.2f|%lu",
+                     name, fontSize, (unsigned long)textColor.hash];
+
+    os_unfair_lock_lock(&lock);
+    if (!cache) cache = [NSMutableDictionary dictionary];
+    UIImage *hit = cache[key];
+    os_unfair_lock_unlock(&lock);
+    if (hit) return hit;
+
+    UIImage *image = [[UIImage systemImageNamed:name
+                              withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:fontSize]]
+                      imageWithTintColor:textColor];
+
+    if (image) {
+        os_unfair_lock_lock(&lock);
+        if (cache.count < 16) cache[key] = image;
+        os_unfair_lock_unlock(&lock);
+    }
+    return image;
+}
+
 
 #pragma mark - Main Widget Functions
 /*
@@ -1620,15 +1799,12 @@ void formatParsedInfo(NSDictionary *parsedInfo, NSInteger parsedID, NSMutableAtt
                 [parsedInfo valueForKey:@"filled"] ? [[parsedInfo valueForKey:@"filled"] boolValue] : YES
             );
             if (![sfSymbolName isEqualToString:@""]) {
-                imageAttachment = [[NSTextAttachment alloc] init];
-                imageAttachment.image = [
-                    [
-                        UIImage systemImageNamed:sfSymbolName
-                        withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:fontSize]
-                    ]
-                    imageWithTintColor:textColor
-                ];
-                [mutableString appendAttributedString:[NSAttributedString attributedStringWithAttachment:imageAttachment]];
+                UIImage *symbolImage = chargingSymbolImage(sfSymbolName, fontSize, textColor);
+                if (symbolImage) {
+                    imageAttachment = [[NSTextAttachment alloc] init];
+                    imageAttachment.image = symbolImage;
+                    [mutableString appendAttributedString:[NSAttributedString attributedStringWithAttachment:imageAttachment]];
+                }
             }
             break;
         case 10:

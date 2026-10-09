@@ -59,6 +59,71 @@ fight over the same performance cores and drag each other's readings down, and t
 offset usage samplers can never agree on a number — which is the whole point of the
 exercise.
 
+## Per-tick cost (and what 0.26 removed)
+
+The HUD runs for as long as the device is up, so everything it does on the render path
+has to be justified. It turned out that a fair amount of it was not — not one big thing,
+but several small ones stacked on the same main-thread pass, which is what "the device
+feels laggy with the HUD on" actually is.
+
+**One timer per widget, where one per set is enough.** `updateInterval` is a property of
+the *set* (`WidgetSetStruct.updateInterval`), so every widget in a set shares an interval
+and has no reason to own a `dispatch_source`. Each one was started with its own
+`dispatch_walltime(NULL, 0)` and its own phase, with a 10 % leeway — so the wake-ups
+never lined up. A set of four widgets meant four main-thread wake-ups per period, four
+rounds of "CoreText layout + frame resize + mask reset", four CA commits. One timer per
+set makes it one. It also means the widgets in a set are sampled on the *same* main-thread
+pass, which is what makes the caches below actually hit.
+
+**`updateLabel` drew both render paths, and only one of them is ever visible.**
+`reloadUserDefaults` guarantees exactly one of them at a time: with adaptive colour on
+(the default) the visible one is the backdrop + maskLabel and `label` is hidden; with it
+off, the other way round. Writing both cost a different price on each side — writing
+`label` invalidates its `intrinsicContentSize`, so all ~6N constraints on `_contentView`
+had to be solved again, and writing `maskLabel` swaps the `CABackdropLayer`'s mask, and
+that layer carries five `CAFilter`s (a 50 pt gaussian blur plus brightness, contrast,
+saturate and invert), so the mask changing forces a re-composite. In the default
+configuration the visible side is the backdrop one, which means every widget was
+*additionally* triggering a full Auto Layout pass per tick, into a label nobody could see.
+
+**CPU temperature was sampled on the render path.** The fast path of
+`getCPUDieTemperature()` enumerates every AppleVendor temperature service, two IOKit
+round-trips each (`CopyProperty` + `CopyEvent`) — dozens of them on an A11. That is a
+synchronous kernel enumeration, and it ran on the main thread every tick. It now works
+the same way the CPU clock does: a background serial queue samples and caches (1 s), and
+the formatter only reads the cache. The very first sample after boot is still taken
+synchronously, so the widget does not flash `??ºC` once on launch.
+
+**Battery properties were re-read up to four times per tick.** The device-temperature,
+battery-detail, battery-percentage and charging-symbol widgets all want the same
+`IOPMPowerSource` dictionary, and each called `getBatteryInfo()` (two IOKit round-trips)
+independently. Now cached for 0.25 s. Same for the tinted charging-symbol bitmap —
+`imageWithTintColor:` is a real rasterisation and it was redone every tick.
+
+**The clock probe ran even when nothing displayed it.** The probe saturates both
+performance cores for ~62 ms at `QOS_CLASS_USER_INTERACTIVE` — which means it preempts
+the foreground; that is not an accident, it is the only way to get CLPC to grant the top
+gear. But the publisher kicked it every second unconditionally, so the device paid a
+double-core stall every 5 s even with no CPU-frequency widget anywhere on the HUD. It is
+now gated on `HeliumCPUFrequencyWidgetInUse()` — "somebody actually drew this number in
+the last 10 s". The shared file's format is unchanged; when nobody is looking `freq_mhz`
+is written as 0, and SysProbe falls back to sampling on its own, which it already did.
+
+**`NOTIFY_RELOAD_HUD` was delivered twice.** It is registered twice — once via
+`notify_register_dispatch` and once via `CFNotificationCenterAddObserver` on the Darwin
+centre — and `notify_post` feeds both. So every settings change ran "read defaults +
+reschedule timers + rebuild every constraint" twice. There is now a 200 ms de-duplication
+window, which is more robust than betting on which registration path is the reliable one.
+
+Deliberately *not* changed:
+
+* The probe's 5 s throttle. If you *do* keep a CPU-frequency widget on screen, that
+  62 ms double-core stall every 5 s is the remaining visible hitch, and it is inherent to
+  measuring the top gear. Removing the widget is now enough to stop it entirely.
+* Adaptive colour's default of on. It is a `CABackdropLayer` with a 50 pt gaussian blur;
+  turning it off is a straight win if you do not need the tinted look, but it is a
+  visible appearance change, so it stays the user's call.
+
 ## Per-second cost (and what 0.25 removed)
 
 The HUD runs for as long as the device is up, so everything it does *per second* has

@@ -77,6 +77,7 @@ extern "C" double HeliumCPUUsageFraction(void);
 extern "C" NSArray<NSNumber *> *HeliumCPUPerCoreFractions(void);
 extern "C" uint64_t HeliumCPUFrequencyKHz(void);
 extern "C" void HeliumCPUFrequencyKick(void);
+extern "C" BOOL HeliumCPUFrequencyWidgetInUse(void);
 
 static dispatch_source_t gPublisherTimer = NULL;
 static dispatch_queue_t gPublisherQueue = NULL;
@@ -158,8 +159,25 @@ static void publishOnce(void)
         }
         if (mhz == 0) {
             // Busy-loop probe (peak achievable clock, not the live DVFS step).
-            HeliumCPUFrequencyKick();
-            mhz = HeliumCPUFrequencyKHz() / 1000ull;
+            //
+            // **只在真的有人看这个数的时候才烧它。**
+            //
+            // 探针是 2 个性能核各约 62 ms 的忙循环，而且它的线程 QoS 是
+            // `QOS_CLASS_USER_INTERACTIVE`（不那样就上不了性能核、读不到顶档）——
+            // 也就是说它**会抢占前台**。原来这里是每秒无条件 kick 一次，于是哪怕
+            // HUD 上根本没有 CPU 频率部件，每 5 秒也照样来一次双性能核饱和：在
+            // 2 + 4 的 A11 上，那就是肉眼可见的周期性掉帧，而且是 HUD 自己造成的。
+            //
+            // 读这个数的只有两处：HUD 上的频率部件，和 SysProbe。前者由
+            // `HeliumCPUFrequencyWidgetInUse()` 回答；后者读共享文件，读不到
+            // （或读到 `freq_mhz: 0`）会回落到它自己的采样 —— 那条降级路径本来
+            // 就在（见 SysProbe 的 `CPUSharedMetrics.swift`）。
+            //
+            // 文件格式没变，键还是那几个；变的只是 `freq_mhz` 在没人看的时候写 0。
+            if (HeliumCPUFrequencyWidgetInUse()) {
+                HeliumCPUFrequencyKick();
+                mhz = HeliumCPUFrequencyKHz() / 1000ull;
+            }
             source = @"probe";
         }
 

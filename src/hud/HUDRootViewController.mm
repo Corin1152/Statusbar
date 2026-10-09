@@ -21,6 +21,19 @@
 #define NOTIFY_UI_LOCKSTATE    "com.apple.springboard.lockstate"
 #define NOTIFY_LS_APP_CHANGED  "com.apple.LaunchServices.ApplicationsChanged"
 
+/// 上一次真正画上去的文本，挂在**当时可见的那个** label 上。
+///
+/// **为什么挂在 label 上而不是存成 ivar**：`createWidgetSetsView` 会把这一整套
+/// label / maskLabel / backdrop 整个重建。重建出来的 label 没有关联对象，于是它的
+/// 第一帧必然重画 —— 这正是想要的语义，省掉一套「视图重建时记得清缓存」的代码。
+/// 存 ivar 反而要额外盯住每一处重建点。
+///
+/// 两个 label 各存各的（见 `updateLabel`）：一个部件的两条渲染路径只有一条可见，
+/// 只有可见的那条会被写、也只有它需要这份缓存。可见性一旦切换（用户在设置里开关
+/// 自适应取色、或者设备转了朝向），另一条路径的缓存必须作废 —— 否则它一露面就会
+/// 因为「文本没变」而被跳过，拿着上一次的旧字符串凑合。
+static const void *kHeliumLastAttributedTextKey = &kHeliumLastAttributedTextKey;
+
 static void LaunchServicesApplicationStateChanged
 (CFNotificationCenterRef center,
  void *observer,
@@ -91,9 +104,7 @@ static void ReloadHUD
     // NSLog(@"boom ReloadHUD");
     HUDRootViewController *rootViewController = (__bridge HUDRootViewController *)observer;
     // [rootViewController createWidgetSets];
-    [rootViewController reloadUserDefaults];
-    [rootViewController resetLoopTimer];
-    [rootViewController updateViewConstraints];
+    [rootViewController performReload];
 }
 
 #pragma mark - HUDRootViewController
@@ -121,9 +132,7 @@ static void ReloadHUD
 {
     int token;
     notify_register_dispatch(NOTIFY_RELOAD_HUD, &token, dispatch_get_main_queue(), ^(int token) {
-        [self reloadUserDefaults];
-        [self resetLoopTimer];
-        [self updateViewConstraints];
+        [self performReload];
     });
 
     CFNotificationCenterRef darwinCenter = CFNotificationCenterGetDarwinNotifyCenter();
@@ -163,6 +172,22 @@ static void ReloadHUD
 {
     if (forceReload || !_userDefaults)
         _userDefaults = [[NSDictionary dictionaryWithContentsOfFile:USER_DEFAULTS_PATH] mutableCopy] ?: [NSMutableDictionary dictionary];
+}
+
+/// 去重窗口，见头文件里 `performReload` 的说明。
+static CFAbsoluteTime gLastReloadStamp = 0;
+
+- (void)performReload
+{
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (now - gLastReloadStamp < 0.2) {
+        return;   // 同一份设置的第二份投递，忽略
+    }
+    gLastReloadStamp = now;
+
+    [self reloadUserDefaults];
+    [self resetLoopTimer];
+    [self updateViewConstraints];
 }
 
 - (void) reloadUserDefaults
@@ -255,6 +280,15 @@ static void ReloadHUD
             // backdropView.layer.borderWidth = 0.0;
             maskLabelView.layer.borderWidth = 0.0;
         }
+
+        // 上面这一段刚把「哪一条渲染路径可见」重新定过（`dynamicColor` 可能被用户
+        // 改了，也可能只是别的属性变了）。两条路径的「上次画上去的文本」都作废：
+        // 只有可见的那条会被写（见 `updateLabel`），另一条本来就没跟上，缓存里那份
+        // 已经不能代表它的真实内容了 —— 留着就会在它下次露面时把重画跳掉。
+        objc_setAssociatedObject(labelView, kHeliumLastAttributedTextKey, nil,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(maskLabelView, kHeliumLastAttributedTextKey, nil,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
 }
 
@@ -370,6 +404,19 @@ static void ReloadHUD
 
 #pragma mark - Timer and View Updating
 
+/// 每个 **widget set** 一个定时器，而不是每个部件一个。
+///
+/// `updateInterval` 本来就是 set 级的属性（`WidgetSetStruct.updateInterval`），
+/// 一个 set 里的所有部件共享同一个间隔 —— 那它们就没有理由各自占一个
+/// `dispatch_source`。原来每个部件一个，于是同一个 set 里的 N 个部件各自
+/// `dispatch_sync` 回主线程一次，而每个 timer 是用 `dispatch_walltime(NULL, 0)` 各自
+/// 起算的、相位互不相同（leeway 又是 10%），所以这 N 次唤醒在时间上永远是散开的：
+/// 一个 set 有 4 个部件，就是每周期 4 次主线程唤醒、4 轮「CoreText 排版 + 帧尺寸
+/// 调整 + 遮罩重设」，CA 也就提交 4 次。合成一个之后是 1 次。
+///
+/// 合并顺带还有一个好处：同一个 tick 里几个部件的取值是在**同一次**主线程 pass 上
+/// 做的，于是 `cpuBusyFractions` 的 0.25 s 缓存、`getBatteryInfo` 的短缓存真的被
+/// 复用上了 —— 原来它们各自落在不同的 pass 里，缓存形同虚设。
 - (void)resetLoopTimer
 {
     NSArray *widgetProps = [self widgetProperties];
@@ -389,8 +436,9 @@ static void ReloadHUD
         BOOL autoResizes = getBoolFromDictKey(properties, @"autoResizes");
         float width = getDoubleFromDictKey(properties, @"scale", 50.0);
         float height = getDoubleFromDictKey(properties, @"scaleY", 12.0);
+        NSString *timerName = [NSString stringWithFormat:@"widgetset%d", i];
         if (isEnabled) {
-            [[EZTimer shareInstance] timer:[NSString stringWithFormat:@"labelview%d", i] timerInterval:updateInterval leeway:0.1 resumeType:EZTimerResumeTypeNow queue:EZTimerQueueTypeConcurrent queueName:@"update" repeats:YES action:^(NSString *timerName) {
+            [[EZTimer shareInstance] timer:timerName timerInterval:updateInterval leeway:0.1 resumeType:EZTimerResumeTypeNow queue:EZTimerQueueTypeConcurrent queueName:@"update" repeats:YES action:^(NSString *name) {
                 dispatch_sync(dispatch_get_main_queue(), ^{
                     [self updateLabel: labelView updateMaskLabel: maskLabelView backdropView: backdropView identifiers: identifiers fontSize: fontSize autoResizes: autoResizes width: width height: height];
                 });
@@ -401,24 +449,53 @@ static void ReloadHUD
             [labelView setHidden:YES];
             [backdropView setHidden:YES];
             [maskLabelView setHidden:YES];
-            [[EZTimer shareInstance] cancel:[NSString stringWithFormat:@"labelview%d", i]];
+            [[EZTimer shareInstance] cancel:timerName];
         }
     }
 }
 
-/// 上一次真正画上去的文本，挂在 `maskLabel` 上。
+/// 缓存键 `kHeliumLastAttributedTextKey` 声明在文件开头，见那里的说明。
 ///
-/// **为什么挂在 label 上而不是存成 ivar**：`createWidgetSetsView` 会把这一整套
-/// label / maskLabel / backdrop 整个重建。重建出来的 label 没有关联对象，于是它的
-/// 第一帧必然重画 —— 这正是想要的语义，省掉一套「视图重建时记得清缓存」的代码。
-/// 存 ivar 反而要额外盯住每一处重建点。
-static const void *kHeliumLastAttributedTextKey = &kHeliumLastAttributedTextKey;
-
+/// 只画**当前可见**的那一条渲染路径。
+///
+/// 每个部件同时有两条路径，`reloadUserDefaults` 保证任意时刻至多只有一条可见：
+///
+///   dynamicColor == YES（默认）→ backdropView + maskLabel 可见，label 隐藏；
+///   dynamicColor == NO         → label 可见，backdrop 与 maskLabel 隐藏。
+///
+/// 原来两条都写，于是每 tick 白付一份代价 —— 而且是两份**性质完全不同**的代价：
+///
+///   * 写 `label` 会 invalidate 它的 intrinsicContentSize，`_contentView` 上那
+///     ~6N 条约束于是要整轮重解一次 Auto Layout；
+///   * 写 `maskLabel` 会换掉 `CABackdropLayer` 的遮罩，那一层挂着 5 个 CAFilter
+///     （半径 50 的高斯模糊 + 亮度 / 对比度 / 饱和度 / 反相），遮罩一变就要重新
+///     合成一次。
+///
+/// 默认配置下可见的是 backdrop 那条（`dynamicColor` 默认 YES），也就是说原来每一个
+/// 部件每 tick 都在**额外**触发一次完整的 Auto Layout，画在一个没人看得见的 label 上。
+///
+/// 两条都不可见时（这个部件被设成只在另一个朝向显示）退到写 `maskLabel`：它不在
+/// Auto Layout 引擎里（它只是 backdropView 的 maskView，没有任何约束），而
+/// backdropView 隐藏时遮罩根本不会被合成 —— 所以这一次几乎不要钱，又能保证转回该
+/// 朝向时文本是新的。
 - (void) updateLabel:(UILabel *) label updateMaskLabel:(UILabel *) maskLabel backdropView:(AnyBackdropView *) backdropView identifiers:(NSArray *) identifiers fontSize:(double) fontSize autoResizes:(BOOL) autoResizes width:(CGFloat) width height:(CGFloat) height
 {
 #if DEBUG
     os_log_debug(OS_LOG_DEFAULT, "updateLabel");
 #endif
+    UILabel *live;
+    if (!backdropView.hidden && !maskLabel.hidden) {
+        live = maskLabel;
+    } else if (!label.hidden) {
+        live = label;
+    } else {
+        live = maskLabel;
+        // 转回该朝向时真正会显示的是 label（如果用户把自适应取色关了），必须重新
+        // 画，不能拿旧文本凑合。这里没写它，就把它的缓存作废。
+        objc_setAssociatedObject(label, kHeliumLastAttributedTextKey, nil,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+
     NSAttributedString *attributedText = formattedAttributedString(identifiers, fontSize, label.textColor, [self apiKey], [self dateLocale]);
     if (!attributedText)
         return;
@@ -433,7 +510,10 @@ static const void *kHeliumLastAttributedTextKey = &kHeliumLastAttributedTextKey;
     //
     // 比较放在 `setAttributedText:` **之前**，代价是一次很短的字符串加属性字典比对，
     // 比它省下的那次排版便宜几个数量级；没命中也只是白比一次。
-    NSAttributedString *drawn = objc_getAssociatedObject(maskLabel, kHeliumLastAttributedTextKey);
+    //
+    // 缓存挂在**实际被写的那一个** label 上（见 `kHeliumLastAttributedTextKey`）：
+    // 两条路径各有各的缓存，谁可见就只维护谁。
+    NSAttributedString *drawn = objc_getAssociatedObject(live, kHeliumLastAttributedTextKey);
     if (drawn && [drawn isEqualToAttributedString: attributedText]) {
         if (autoResizes) {
             // `sizeThatFits:` 的结果只取决于文本，文本没变尺寸就没变。
@@ -444,12 +524,15 @@ static const void *kHeliumLastAttributedTextKey = &kHeliumLastAttributedTextKey;
         if (CGSizeEqualToSize(maskLabel.frame.size, CGSizeMake(width, height)))
             return;
     }
-    objc_setAssociatedObject(maskLabel, kHeliumLastAttributedTextKey, attributedText,
+    objc_setAssociatedObject(live, kHeliumLastAttributedTextKey, attributedText,
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
     // NSLog(@"boom attr:%@", attributedText);
-    [label setAttributedText: attributedText];
-    [maskLabel setAttributedText: attributedText];
+    [live setAttributedText: attributedText];
+
+    // 尺寸一律写在 `maskLabel` 上，不管刚才文本写进了谁 —— 这是原来就有的行为，
+    // 不能改：`label` 上有 `updateViewConstraints` 建的宽高约束，直接给它写 frame
+    // 会跟 Auto Layout 打架（下一轮 layout 会把 frame 覆盖回去）。
     if (autoResizes) {
         [self useSizeThatFitsZeroWithLabel:maskLabel];
     } else {
@@ -474,7 +557,7 @@ static const void *kHeliumLastAttributedTextKey = &kHeliumLastAttributedTextKey;
         NSDictionary *properties = [widgetProps objectAtIndex:i];
         if (!getBoolFromDictKey(properties, @"isEnabled"))
             continue;
-        [[EZTimer shareInstance] pause:[NSString stringWithFormat:@"labelview%d", i]];
+        [[EZTimer shareInstance] pause:[NSString stringWithFormat:@"widgetset%d", i]];
     }
 
     // 发布器跟着一起停。
@@ -494,7 +577,7 @@ static const void *kHeliumLastAttributedTextKey = &kHeliumLastAttributedTextKey;
         NSDictionary *properties = [widgetProps objectAtIndex:i];
         if (!getBoolFromDictKey(properties, @"isEnabled"))
             continue;
-        [[EZTimer shareInstance] resume:[NSString stringWithFormat:@"labelview%d", i]];
+        [[EZTimer shareInstance] resume:[NSString stringWithFormat:@"widgetset%d", i]];
     }
 
     // 恢复发布器；它内部会立刻补一次发布，所以文件在解锁的那一刻就是新鲜的。
