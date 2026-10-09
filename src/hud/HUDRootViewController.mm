@@ -527,7 +527,6 @@ static CFAbsoluteTime gLastReloadStamp = 0;
     if (i >= (int)_blurViews.count || i >= (int)_labelViews.count ||
         i >= (int)_backdropViews.count || i >= (int)_maskLabelViews.count)
         return;
-    UIVisualEffectView *blurView = [_blurViews objectAtIndex:i];
     UILabel *labelView = [_labelViews objectAtIndex:i];
     AnyBackdropView *backdropView = [_backdropViews objectAtIndex: i];
     UILabel *maskLabelView = [_maskLabelViews objectAtIndex:i];
