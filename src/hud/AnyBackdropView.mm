@@ -98,36 +98,47 @@ static const double kHeliumLumaB = 0.0722;
 /// 动画）就得重新采样并重新过滤，而滤镜按面积跑 —— 一趟比四趟少 3 个全分辨率 pass。
 - (NSArray<CAFilter *> *) _colorFilters {
     if (self.compressedFilters) {
-        CAFilter *matrixFilter = [CAFilter filterWithName:kCAFilterColorMatrix];
-        // 先问一句 `inputKeys` 再设值：`setValue:forKey:` 碰到不认识的键会抛
-        // `NSUnknownKeyException`，而这是常驻的 HUD 守护进程 —— 崩不起。问不到就安静地
-        // 退回 4 趟版本（观感与以前完全一致，只是没省下那 3 趟），并留一条日志。
-        BOOL canUseMatrix = matrixFilter
-            && [matrixFilter.inputKeys containsObject:@"inputColorMatrix"]
-            && [NSValue respondsToSelector:@selector(valueWithCAColorMatrix:)];
-        if (canUseMatrix) {
-            // `CAColorMatrix` 的字段是 float，而上面那两个参数和亮度权重是 double ——
-            // C++11 的聚合初始化**不允许**隐式窄化（-Wc++11-narrowing 在这里是 error），
-            // 所以先全部落到 float 上再填。
-            // A = 对比度；B = A·亮度 − A/2 + 1/2（把「亮度然后对比度」写成一个仿射）。
-            const float A = (float)kHeliumContrast;
-            const float wR = (float)kHeliumLumaR;
-            const float wG = (float)kHeliumLumaG;
-            const float wB = (float)kHeliumLumaB;
-            const float B = A * (float)kHeliumBrightness - A * 0.5f + 0.5f;
-            const float offset = 1.0f - B;   // 输出 = offset − A·(w·x)
-            CAColorMatrix m = {
-                -A * wR, -A * wG, -A * wB, 0.0f, offset,
-                -A * wR, -A * wG, -A * wB, 0.0f, offset,
-                -A * wR, -A * wG, -A * wB, 0.0f, offset,
-                 0.0f,    0.0f,    0.0f,    1.0f, 0.0f,
-            };
-            [matrixFilter setValue:[NSValue valueWithCAColorMatrix:m] forKey:@"inputColorMatrix"];
-            return @[matrixFilter];
+        @try {
+            CAFilter *matrixFilter = [CAFilter filterWithName:kCAFilterColorMatrix];
+            // 可用性检查**只用 `respondsToSelector:`** —— 它对任何对象都安全。
+            //
+            // 0.27 在这里直接调了 `matrixFilter.inputKeys`，真机（iOS 16.5）上
+            // CAFilter 根本不响应这个方法：unrecognized selector → 常驻 HUD 进程
+            // abort → 部件全部消失（崩溃日志 Helium-2026-10-09-160003.ips 实锤，
+            // 崩点正在这条 stub 上）。而 `setValue:forKey:` 是 CAFilter 自己实现的
+            // KVC 入口，0.25 起的 4 趟链一直靠它工作，不经过 `inputKeys`。
+            BOOL canUseMatrix = matrixFilter != nil
+                && [matrixFilter respondsToSelector:@selector(setValue:forKey:)]
+                && [NSValue respondsToSelector:@selector(valueWithCAColorMatrix:)];
+            if (canUseMatrix) {
+                // `CAColorMatrix` 的字段是 float，而上面那两个参数和亮度权重是 double ——
+                // C++11 的聚合初始化**不允许**隐式窄化（-Wc++11-narrowing 在这里是 error），
+                // 所以先全部落到 float 上再填。
+                // A = 对比度；B = A·亮度 − A/2 + 1/2（把「亮度然后对比度」写成一个仿射）。
+                const float A = (float)kHeliumContrast;
+                const float wR = (float)kHeliumLumaR;
+                const float wG = (float)kHeliumLumaG;
+                const float wB = (float)kHeliumLumaB;
+                const float B = A * (float)kHeliumBrightness - A * 0.5f + 0.5f;
+                const float offset = 1.0f - B;   // 输出 = offset − A·(w·x)
+                CAColorMatrix m = {
+                    -A * wR, -A * wG, -A * wB, 0.0f, offset,
+                    -A * wR, -A * wG, -A * wB, 0.0f, offset,
+                    -A * wR, -A * wG, -A * wB, 0.0f, offset,
+                     0.0f,    0.0f,    0.0f,    1.0f, 0.0f,
+                };
+                // `setValue:forKey:` 碰到不认识的键会抛 `NSUnknownKeyException` ——
+                // 上面那个 @catch 会接住它并退回 4 趟。常驻进程崩不起，宁可白跑。
+                [matrixFilter setValue:[NSValue valueWithCAColorMatrix:m] forKey:@"inputColorMatrix"];
+                return @[matrixFilter];
+            }
+        } @catch (NSException *exception) {
+            // 任何一步不符合预期（类不在、方法不响应、键不认识）都安静地退回 4 趟：
+            // 观感与 0.26 完全一致，只是没省下那 3 趟 —— 绝不能让 HUD 进程死掉。
+            os_log_error(OS_LOG_DEFAULT,
+                         "Helium: 压缩滤镜不可用（%@: %@），退回 4 趟颜色滤镜",
+                         exception.name, exception.reason);
         }
-        os_log_error(OS_LOG_DEFAULT,
-                     "Helium: kCAFilterColorMatrix 不可用（inputKeys=%@），退回 4 趟颜色滤镜",
-                     matrixFilter ? matrixFilter.inputKeys : nil);
     }
 
     CAFilter *brightnessFilter = [CAFilter filterWithName:kCAFilterColorBrightness];

@@ -179,6 +179,12 @@ static CFAbsoluteTime gLastReloadStamp = 0;
 
 - (void)performReload
 {
+    // `viewDidLoad` 之前视图数组还是空的（init 只建了容器），而 plist 里的部件配置
+    // 非空 —— 此时跑 `reloadUserDefaults` 会对空数组 `objectAtIndex:` 越界。直接跳过：
+    // `viewDidLoad` 末尾会**同步**补上这一次 reload，见那里的说明。
+    if (!_contentView)
+        return;
+
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
     if (now - gLastReloadStamp < 0.2) {
         return;   // 同一份设置的第二份投递，忽略
@@ -399,6 +405,15 @@ static CFAbsoluteTime gLastReloadStamp = 0;
     // Publish this HUD's CPU readings to the shared file so SysProbe can show the
     // same numbers instead of sampling on its own (see CPUMetricsPublisher.mm).
     helium_start_cpu_metrics_publisher();
+    // 启动时的初始化 reload **同步**跑掉，不再依赖通知投递的时机。
+    //
+    // 通知是异步的：`notify_post` 之后两份投递（dispatch block 与 CF 回调）要等
+    // runloop 转起来才执行，而「hidden 归位 / 定时器建好 / 约束挂上」这三件事必须
+    // 发生在第一个渲染 tick 之前 —— 真机上 0.26/0.27 「启用 HUD 后部件一直不显示、
+    // 手动改一次设置才出现」就出在这个先后顺序上（改设置的那次通知跑完了三步，
+    // 启动时的一次没有）。同步调用之后，随后的通知投递要么被 200 ms 去重窗口吞掉
+    // （内容相同，无害），要么作为一次幂等重跑。
+    [self performReload];
     notify_post(NOTIFY_RELOAD_HUD);
 }
 

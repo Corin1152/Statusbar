@@ -99,14 +99,30 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: statusbar-${{ github.run_number }}
-          name: Statusbar 0.27 (build ${{ github.run_number }})
+          name: Statusbar 0.28 (build ${{ github.run_number }})
           body: |
-            基于 Helium 改版。应用名改为 Statusbar，版本从 0.01 起（本次 0.27）。
+            基于 Helium 改版。应用名改为 Statusbar，版本从 0.01 起（本次 0.28）。
 
             界面：只有「首页 / 自定义」两页，首页右上角直接显示版本号（无齿轮/设置入口）。
             部件：原有 9 个 + CPU温度 / CPU占用 / CPU频率 / 蜂窝信号（RSRP）。
 
-            本次改动（0.27：自适应取色「关掉之后看不见」的兜底 + 成本旋钮）：
+            本次改动（0.28：修复 0.26/0.27 真机「启用 HUD 部件不显示」，感谢用户的崩溃日志定位）：
+
+              · 修复启动崩溃 —— 部件全部消失的直接原因。0.27 的压缩滤镜在可用性
+                检查里直接调用了 CAFilter 的私有方法 `inputKeys`，真机（iOS 16.5）
+                上它根本不响应这个方法：unrecognized selector 直接把常驻 HUD 进程
+                杀掉。这就是「开启压缩滤镜后完全无法显示」的原因。现在可用性检查
+                全部改用对任何对象都安全的 `respondsToSelector:`，并且整条压缩路径
+                包进 @try/@catch：任何一步不符合预期（类不在 / 方法不响应 / 键不
+                认识）都安静退回 4 趟滤镜，绝不再让进程死掉。
+
+              · 修复「启用 HUD 后部件一直不显示、手动改一次设置才出现」：启动时的
+                初始化 reload 原来靠 notify_post 异步投递，三步初始化（hidden 归位 /
+                定时器建好 / 约束挂上）可能晚于第一个渲染 tick 才跑。现在
+                viewDidLoad 里同步跑掉这一次，notify_post 保留给设置变更用。另给
+                performReload 加了视图未建好的防御。
+
+            0.27 的内容（自适应取色的旋钮与描边兜底，机制说明仍然成立）：
 
               · 先纠正一个长期被误解的地方：设置里的 Adaptive Color（自适应颜色）**不是**
                 给部件加背景色，而是让**文字颜色自动与背后内容相反**。它靠
