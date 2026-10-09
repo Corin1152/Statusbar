@@ -106,15 +106,21 @@ static const double kHeliumLumaB = 0.0722;
             && [matrixFilter.inputKeys containsObject:@"inputColorMatrix"]
             && [NSValue respondsToSelector:@selector(valueWithCAColorMatrix:)];
         if (canUseMatrix) {
+            // `CAColorMatrix` 的字段是 float，而上面那两个参数和亮度权重是 double ——
+            // C++11 的聚合初始化**不允许**隐式窄化（-Wc++11-narrowing 在这里是 error），
+            // 所以先全部落到 float 上再填。
             // A = 对比度；B = A·亮度 − A/2 + 1/2（把「亮度然后对比度」写成一个仿射）。
-            const double A = kHeliumContrast;
-            const double B = A * kHeliumBrightness - A * 0.5 + 0.5;
-            const double offset = 1.0 - B;   // 输出 = offset − A·(w·x)
+            const float A = (float)kHeliumContrast;
+            const float wR = (float)kHeliumLumaR;
+            const float wG = (float)kHeliumLumaG;
+            const float wB = (float)kHeliumLumaB;
+            const float B = A * (float)kHeliumBrightness - A * 0.5f + 0.5f;
+            const float offset = 1.0f - B;   // 输出 = offset − A·(w·x)
             CAColorMatrix m = {
-                -A * kHeliumLumaR, -A * kHeliumLumaG, -A * kHeliumLumaB, 0.0, offset,
-                -A * kHeliumLumaR, -A * kHeliumLumaG, -A * kHeliumLumaB, 0.0, offset,
-                -A * kHeliumLumaR, -A * kHeliumLumaG, -A * kHeliumLumaB, 0.0, offset,
-                 0.0,              0.0,              0.0,              1.0, 0.0,
+                -A * wR, -A * wG, -A * wB, 0.0f, offset,
+                -A * wR, -A * wG, -A * wB, 0.0f, offset,
+                -A * wR, -A * wG, -A * wB, 0.0f, offset,
+                 0.0f,    0.0f,    0.0f,    1.0f, 0.0f,
             };
             [matrixFilter setValue:[NSValue valueWithCAColorMatrix:m] forKey:@"inputColorMatrix"];
             return @[matrixFilter];
