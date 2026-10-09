@@ -228,7 +228,7 @@ static CFAbsoluteTime gLastReloadStamp = 0;
                                attributesOfItemAtPath:USER_DEFAULTS_PATH error:nil];
         helium_dbg(@"performReload begin: plist size=%llu mtime=%.1f",
                    (unsigned long long)attrs.fileSize,
-                   attrs.modificationDate.timeIntervalSince1970);
+                   attrs.fileModificationDate.timeIntervalSince1970);
     }
 
     [self reloadUserDefaults];
