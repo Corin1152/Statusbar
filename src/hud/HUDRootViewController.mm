@@ -232,7 +232,13 @@ static CFAbsoluteTime gLastReloadStamp = 0;
         UIFont *textFont = [FontUtils loadFontWithName:fontName size: getDoubleFromDictKey(properties, @"fontSize", 10) bold: getBoolFromDictKey(properties, @"textBold") italic: getBoolFromDictKey(properties, @"textItalic")];
         double textAlpha = getDoubleFromDictKey(properties, @"textAlpha", 1.0);
         BOOL dynamicColor = getBoolFromDictKey(properties, @"dynamicColor", true);
-        
+
+        // 自适应取色那条路径的两个旋钮。它们只影响成本、不影响可读性（见 AnyBackdropView
+        // 里 `_colorFilters` 的说明），所以直接推给 backdrop 就行 —— 它自己会在值真的
+        // 变了的时候才重建滤镜链，这里每次改设置都推一遍是安全的。
+        backdropView.blurRadius = (CGFloat)getDoubleFromDictKey(properties, @"blurRadius", 50.0);
+        backdropView.compressedFilters = getBoolFromDictKey(properties, @"useCompressedFilters");
+
         labelView.textAlignment = (NSTextAlignment)textAlign;
         labelView.font = textFont;
         maskLabelView.textAlignment = (NSTextAlignment)textAlign;
@@ -440,7 +446,7 @@ static CFAbsoluteTime gLastReloadStamp = 0;
         if (isEnabled) {
             [[EZTimer shareInstance] timer:timerName timerInterval:updateInterval leeway:0.1 resumeType:EZTimerResumeTypeNow queue:EZTimerQueueTypeConcurrent queueName:@"update" repeats:YES action:^(NSString *name) {
                 dispatch_sync(dispatch_get_main_queue(), ^{
-                    [self updateLabel: labelView updateMaskLabel: maskLabelView backdropView: backdropView identifiers: identifiers fontSize: fontSize autoResizes: autoResizes width: width height: height];
+                    [self updateLabel: labelView updateMaskLabel: maskLabelView backdropView: backdropView identifiers: identifiers fontSize: fontSize autoResizes: autoResizes width: width height: height properties: properties];
                 });
             }];
         } else {
@@ -452,6 +458,23 @@ static CFAbsoluteTime gLastReloadStamp = 0;
             [[EZTimer shareInstance] cancel:timerName];
         }
     }
+}
+
+/// 描边色：按**亮度**在纯黑 / 纯白之间二选一，而不是做分量取反。
+///
+/// 分量取反在中间灰上会得到它自己（0.5 → 0.5），等于没描边 —— 而那恰好是最需要兜底的
+/// 一档背景。按亮度二选一则在两端都给最大反差：白字配黑边、黑字配白边。
+static UIColor *HeliumOutlineColorForTextColor(UIColor *textColor)
+{
+    CGFloat r = 0.0, g = 0.0, b = 0.0, a = 1.0;
+    if (![textColor getRed:&r green:&g blue:&b alpha:&a]) {
+        // 非 RGB 色彩空间（灰度色、pattern / dynamic 色）取不到分量，退到黑边：
+        // 默认字色是白，这也是最常见的那一档。
+        return [UIColor blackColor];
+    }
+    // 与颜色滤镜同一套 Rec.709 权重，保证和自适应那条路的判断口径一致。
+    CGFloat luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    return luma > 0.5 ? [UIColor blackColor] : [UIColor whiteColor];
 }
 
 /// 缓存键 `kHeliumLastAttributedTextKey` 声明在文件开头，见那里的说明。
@@ -478,7 +501,7 @@ static CFAbsoluteTime gLastReloadStamp = 0;
 /// Auto Layout 引擎里（它只是 backdropView 的 maskView，没有任何约束），而
 /// backdropView 隐藏时遮罩根本不会被合成 —— 所以这一次几乎不要钱，又能保证转回该
 /// 朝向时文本是新的。
-- (void) updateLabel:(UILabel *) label updateMaskLabel:(UILabel *) maskLabel backdropView:(AnyBackdropView *) backdropView identifiers:(NSArray *) identifiers fontSize:(double) fontSize autoResizes:(BOOL) autoResizes width:(CGFloat) width height:(CGFloat) height
+- (void) updateLabel:(UILabel *) label updateMaskLabel:(UILabel *) maskLabel backdropView:(AnyBackdropView *) backdropView identifiers:(NSArray *) identifiers fontSize:(double) fontSize autoResizes:(BOOL) autoResizes width:(CGFloat) width height:(CGFloat) height properties:(NSDictionary *) properties
 {
 #if DEBUG
     os_log_debug(OS_LOG_DEFAULT, "updateLabel");
@@ -499,6 +522,34 @@ static CFAbsoluteTime gLastReloadStamp = 0;
     NSAttributedString *attributedText = formattedAttributedString(identifiers, fontSize, label.textColor, [self apiKey], [self dateLocale]);
     if (!attributedText)
         return;
+
+    // 关掉自适应取色时，给字形加一圈**反色描边**。
+    //
+    // 自适应取色开着的时候填充色是被背后画面反过来的（见 AnyBackdropView），一定看得
+    // 见；关掉之后填充色由用户自己挑，可能正好落在背景上 —— 白字白底就彻底没了。
+    // 描边是这条路径的兜底：填充与描边互为反色，任何背景上至少有一个是显眼的。
+    //
+    // 只在 `live == label`（也就是自适应取色关着的那条路径）上加：自适应那条路本身
+    // 已经把背后压成纯黑 / 纯白再翻过来，再加描边纯属白花钱。
+    //
+    // 注意描边是加在**最终字符串**上的，所以它天然进了下面那次缓存比对 —— 开关一变，
+    // 文本就真的变了，缓存自动失效，不需要额外作废。
+    if (live == label && getBoolFromDictKey(properties, @"textStroke", true)) {
+        double strokeWidth = getDoubleFromDictKey(properties, @"textStrokeWidth", 3.0);
+        if (strokeWidth > 0.0) {
+            NSMutableAttributedString *stroked = [attributedText mutableCopy];
+            NSRange all = NSMakeRange(0, stroked.length);
+            [stroked addAttribute:NSStrokeColorAttributeName
+                            value:HeliumOutlineColorForTextColor(label.textColor)
+                            range:all];
+            // `NSStrokeWidthAttributeName` 的单位是**字号百分比**。负值 = 描边 + 填充；
+            // 正值只描边，字心会变空。
+            [stroked addAttribute:NSStrokeWidthAttributeName
+                            value:@(-strokeWidth)
+                            range:all];
+            attributedText = stroked;
+        }
+    }
 
     // 内容一个字都没变就整个跳过。
     //

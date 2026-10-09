@@ -159,6 +159,11 @@
 "Text Color" = "文本颜色";
 "Set Text Color" = "设置文本颜色";
 "Adaptive Color" = "自适应颜色";
+"Adaptive Blur Radius" = "自适应模糊半径";
+"Compressed Filters" = "压缩滤镜";
+"Compressed Filters Hint" = "实验功能：把自适应文字背后的 4 趟颜色滤镜压成 1 趟颜色矩阵，每一帧都省 GPU。代价是输出从 8 级灰变成纯黑白 —— 反差更大、层次更少。";
+"Text Outline" = "文字描边";
+"Outline Width" = "描边宽度";
 "Text Font" = "文本字体";
 "Font Preview" = "预览Abc123";
 "Bold Text" = "粗体文本";

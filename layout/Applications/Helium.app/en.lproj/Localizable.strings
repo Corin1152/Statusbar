@@ -159,6 +159,11 @@
 "Text Color" = "Text Color";
 "Set Text Color" = "Set Text Color";
 "Adaptive Color" = "Adaptive Color";
+"Adaptive Blur Radius" = "Adaptive Blur Radius";
+"Compressed Filters" = "Compressed Filters";
+"Compressed Filters Hint" = "Experimental: collapses the four colour passes behind adaptive text into a single colour matrix, saving GPU work on every frame. The output becomes pure black-and-white instead of eight shades of grey, so contrast goes up and nuance goes down.";
+"Text Outline" = "Text Outline";
+"Outline Width" = "Outline Width";
 "Text Font" = "Text Font";
 "Font Preview" = "Preview Abc123";
 "Bold Text" = "Bold Text";

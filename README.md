@@ -122,7 +122,58 @@ Deliberately *not* changed:
   measuring the top gear. Removing the widget is now enough to stop it entirely.
 * Adaptive colour's default of on. It is a `CABackdropLayer` with a 50 pt gaussian blur;
   turning it off is a straight win if you do not need the tinted look, but it is a
-  visible appearance change, so it stays the user's call.
+  visible appearance change, so it stays the user's call. 0.27 makes the blur radius and
+  the colour chain tunable instead — see the next section.
+
+## Adaptive colour (and what 0.27 added)
+
+Adaptive Color is easy to misread from its name: it does **not** paint a background
+behind the widget. It makes the *text colour* the inverse of whatever is behind it.
+`AnyBackdropView` is a private `CABackdropLayer`, so it can sample windows that are *not*
+its own — which is exactly why a plain `compositingFilter` (`"differenceBlendMode"`)
+cannot do the job: blend modes only compose inside one layer tree, and the HUD is its own
+window. The sampled backdrop runs through five `CAFilter`s:
+
+    gaussianBlur    inputRadius 50, inputNormalizeEdges YES
+    colorBrightness -0.285
+    colorContrast    1000
+    colorSaturate    0
+    colorInvert
+
+Brightness and contrast together are a hard threshold at 78.5% luma; saturation and invert
+then turn that into "black on light backgrounds, white on dark ones". So the blur radius is
+**not** what makes text readable — it only controls how smoothly the decision varies in
+space. That distinction is what 0.27 exposes:
+
+* **Adaptive Blur Radius** (0–50, default 50). Lowering it — down to 0, which skips the
+  blur entirely — costs nothing in readability.
+* **Compressed Filters** (default off, experimental). Folds the four colour passes into a
+  single `kCAFilterColorMatrix`. Brightness-then-contrast is affine (`x → 1000x − 784.5`),
+  saturation-then-invert is affine too, and because the Rec.709 luma weights sum to 1 the
+  constant term survives the saturation step — so the whole chain is one affine map, i.e.
+  one matrix. What does *not* survive is the `clamp` CA performs between passes, so the
+  output becomes pure black-and-white instead of the eight grey levels the four-pass chain
+  produces (each channel binarised independently, then luma-averaged). More contrast, less
+  nuance. Compare it on device; the toggle is there to be flipped back. The pass is set up
+  only if `inputColorMatrix` is actually in the filter's `inputKeys` — `setValue:forKey:`
+  on an unknown key raises `NSUnknownKeyException`, and this is a resident daemon, so it
+  falls back to the four-pass chain and logs instead of crashing.
+* **Text Outline** (default on). When adaptive colour is *off*, the fill colour is the
+  user's own choice and can land on a matching background — white on white disappears. The
+  outline is the fallback for that path: fill and outline are inverses, so at least one of
+  them stands out. The outline colour is picked as pure black or pure white by **luma**,
+  not by inverting each channel — inverting 0.5 grey gives 0.5 grey, i.e. no outline at
+  all, and mid-grey is precisely the background that needs one. Width is a percentage of
+  the font size (negative `NSStrokeWidthAttributeName` = stroke *and* fill). It is applied
+  only on the non-adaptive path; the adaptive path already guarantees contrast, so an
+  outline there would be pure waste.
+
+Deliberately *not* changed: `backdropView` has no constraints of its own, so the engine
+forces its frame to match `labelView`'s — the whole widget rect. Filters run over that
+whole rect and are only masked down to the glyphs afterwards, so a widget pays for a
+full-rect blur plus (by default) four full-rect colour passes in order to tint a few
+glyphs. This is upstream Helium's behaviour (verified line by line against
+`leminlimez/Helium`), not something this fork introduced.
 
 ## Per-second cost (and what 0.25 removed)
 

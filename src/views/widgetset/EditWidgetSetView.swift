@@ -43,6 +43,12 @@ struct EditWidgetSetView: View {
     @State var customColor: Color = .white
     @State var dynamicColor: Bool = true
     
+    // MARK: Adaptive-color / readability knobs (see WidgetSetStruct)
+    @State var textStroke: Bool = true
+    @State var textStrokeWidth: Double = 3.0
+    @State var blurRadius: Double = 50.0
+    @State var useCompressedFilters: Bool = false
+    
     @State var textBold: Bool = false
     @State var textItalic: Bool = false
     @State var fontName: String = "System Font"
@@ -273,9 +279,73 @@ struct EditWidgetSetView: View {
                                     }
                             }
                         }
+                        // MARK: Text Outline
+                        // 自适应取色关掉之后颜色由用户自己挑，可能正好落在背景上 —— 白字白底
+                        // 就彻底看不见了。描边是这条路径的兜底：填充与描边互为反色，任何背景
+                        // 上至少有一个是显眼的。
+                        HStack {
+                            Toggle(isOn: $textStroke) {
+                                Text(NSLocalizedString("Text Outline", comment: ""))
+                                    .bold()
+                                    .minimumScaleFactor(0.5)
+                            }
+                            .onChange(of: textStroke) { _ in
+                                changesMade = true
+                            }
+                        }
+                        if textStroke {
+                            // MARK: Outline Width
+                            VStack {
+                                HStack {
+                                    Text(NSLocalizedString("Outline Width", comment: ""))
+                                        .bold()
+                                    Spacer()
+                                }
+                                BetterSlider(value: $textStrokeWidth, bounds: 0.5...8.0)
+                                    .onChange(of: textStrokeWidth) { _ in
+                                        changesMade = true
+                                    }
+                            }
+                        }
                     }
                 } header: {
                     Text(NSLocalizedString("Text Color", comment: ""))
+                }
+                
+                // MARK: Adaptive Color
+                // 自适应取色（开着的时候）走的是「把背后压成黑/白再翻过来」这条路，这里
+                // 两个旋钮都只影响它的成本，不影响它的可读性。
+                if dynamicColor {
+                    Section {
+                        // MARK: Adaptive Blur Radius
+                        VStack {
+                            HStack {
+                                Text(NSLocalizedString("Adaptive Blur Radius", comment: ""))
+                                    .bold()
+                                Spacer()
+                            }
+                            BetterSlider(value: $blurRadius, bounds: 0...50, step: 1)
+                                .onChange(of: blurRadius) { _ in
+                                    changesMade = true
+                                }
+                        }
+                        // MARK: Compressed Filters
+                        HStack {
+                            Toggle(isOn: $useCompressedFilters) {
+                                Text(NSLocalizedString("Compressed Filters", comment: ""))
+                                    .bold()
+                                    .minimumScaleFactor(0.5)
+                            }
+                            .onChange(of: useCompressedFilters) { _ in
+                                changesMade = true
+                            }
+                        }
+                        Text(NSLocalizedString("Compressed Filters Hint", comment: ""))
+                            .font(.footnote)
+                            .foregroundColor(.secondary)
+                    } header: {
+                        Text(NSLocalizedString("Adaptive Color", comment: ""))
+                    }
                 }
                 
                 if !dynamicColor {
@@ -519,6 +589,11 @@ struct EditWidgetSetView: View {
                 usesCustomColor = widgetSet.colorDetails.usesCustomColor
                 customColor = Color(widgetSet.colorDetails.color)
                 
+                textStroke = widgetSet.textStroke
+                textStrokeWidth = widgetSet.textStrokeWidth
+                blurRadius = widgetSet.blurRadius
+                useCompressedFilters = widgetSet.useCompressedFilters
+                
                 fontName = widgetSet.fontName
                 textBold = widgetSet.textBold
                 textItalic = widgetSet.textItalic
@@ -588,6 +663,11 @@ struct EditWidgetSetView: View {
                 usesCustomColor: usesCustomColor,
                 color: UIColor(customColor)
             ),
+            
+            textStroke: textStroke,
+            textStrokeWidth: textStrokeWidth,
+            blurRadius: blurRadius,
+            useCompressedFilters: useCompressedFilters,
             
             fontName: fontName,
             textBold: textBold,
