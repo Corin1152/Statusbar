@@ -13,13 +13,16 @@
     #import <os/log.h>
 #endif
 
-#define USER_DEFAULTS_PATH @"/var/mobile/Library/Preferences/com.leemin.helium.plist"
+// 偏好文件的路径。**改这里等于改 bundle id 对应的偏好存储位置** —— 0.31 把
+// com.leemin.helium 改成 com.corin.Statusbar 时一并改了，所以旧版本的部件设置
+// 不会被继承（新 App 是全新的 bundle id，本来也读不到旧的容器）。
+#define USER_DEFAULTS_PATH @"/var/mobile/Library/Preferences/com.corin.Statusbar.plist"
 
 // HUD -> APP: Notify APP that the HUD's view is appeared.
-#define NOTIFY_LAUNCHED_HUD "com.leemin.notification.hud.launched"
+#define NOTIFY_LAUNCHED_HUD "com.corin.Statusbar.notification.hud.launched"
 
 // APP -> HUD: Notify HUD to dismiss itself.
-#define NOTIFY_DISMISSAL_HUD "com.leemin.notification.hud.dismissal"
+#define NOTIFY_DISMISSAL_HUD "com.corin.Statusbar.notification.hud.dismissal"
 
 // APP -> HUD: Notify HUD that the user defaults has been changed by APP.
-#define NOTIFY_RELOAD_HUD "com.leemin.notification.hud.reload"
+#define NOTIFY_RELOAD_HUD "com.corin.Statusbar.notification.hud.reload"
