@@ -99,9 +99,17 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: statusbar-${{ github.run_number }}
-          name: Statusbar 0.31 (build ${{ github.run_number }})
+          name: Statusbar 0.32 (build ${{ github.run_number }})
           body: |
-            基于 Helium 改版。应用名改为 Statusbar，版本从 0.01 起（本次 0.31）。
+            基于 Helium 改版。应用名改为 Statusbar，版本从 0.01 起（本次 0.32）。
+
+            本次改动（0.32：换应用图标）：
+
+              · 图标去掉中间的红气球，只留状态栏符号（三格信号 + 电池），
+                并把它们的颜色从白色改成**红色**，在蓝天白云上更醒目；
+                黄色闪电保留。配色与上一版一致（蓝 / 红 / 黄）。
+              · 其余与 0.31 相同：两个 App 各自读 IOReport、不共享文件、
+                bundle id 为 com.corin.Statusbar。
 
             本次改动（0.31：CPU 频率改用 IOReport 真实档位 + 关闭诊断日志）：
 
