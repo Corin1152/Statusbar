@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleIdentifier</key>
-	<string>com.leemin.helium</string>
+	<string>com.corin.Statusbar</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
@@ -45,7 +45,7 @@
 			<key>CFBundleTypeRole</key>
 			<string>Editor</string>
 			<key>CFBundleURLName</key>
-			<string>com.leemin.helium</string>
+			<string>com.corin.Statusbar</string>
 			<key>CFBundleURLSchemes</key>
 			<array>
 				<string>helium</string>

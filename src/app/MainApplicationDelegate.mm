@@ -2,7 +2,6 @@
 #import "MainApplication.h"
 #import "Helium-Swift.h"
 #import "../extensions/FontUtils.h"
-#import "../widgets/CPUMetricsPublisher.h"
 
 @implementation MainApplicationDelegate
 
@@ -26,16 +25,9 @@
     [self.window setRootViewController:[[[ContentInterface alloc] init] createUI]];
     [self.window makeKeyAndVisible];
 
-    // Start the CPU-metrics publisher here as well, not only in the HUD.
-    //
-    // The HUD runs as a *separate* process (`Helium -hud`, started by the
-    // LaunchDaemon) and is the one that publishes continuously. But that process is
-    // KeepAlive, so after a TrollStore reinstall it keeps running the *old* binary
-    // until the device reboots — whereas this main app is relaunched every time the
-    // user taps the icon. Starting the publisher here means the shared metrics file
-    // and the one-shot IOReport diagnosis refresh as soon as the app is opened,
-    // with no reboot needed.
-    helium_start_cpu_metrics_publisher();
+    // 0.31：这里原来还会启动「共享指标发布器」（`CPUMetricsPublisher`），把 CPU 占用
+    // 与频率写进 /var/tmp/cpu_metrics.json 供 SysProbe 读。那条路已整段删除 ——
+    // 两个 App 现在各自读 IOReport，谁也不依赖谁。
 
     return YES;
 }

@@ -56,7 +56,7 @@
 	<key>com.apple.coreaudio.register-internal-aus</key>
 	<true/>
 	<key>com.apple.developer.ubiquity-kvstore-identifier</key>
-	<string>com.leemin.helium</string>
+	<string>com.corin.Statusbar</string>
 	<key>com.apple.diagnosticd.diagnostic</key>
 	<true/>
 	<key>com.apple.frontboard.debugapplications</key>
@@ -171,11 +171,11 @@
 	</array>
 	<key>com.apple.security.exception.mach-register.global-name</key>
 	<array>
-		<string>com.leemin.helium.gsEvents</string>
+		<string>com.corin.Statusbar.gsEvents</string>
 	</array>
 	<key>com.apple.security.exception.mach-register.local-name</key>
 	<array>
-		<string>com.leemin.helium</string>
+		<string>com.corin.Statusbar</string>
 	</array>
 	<key>com.apple.security.exception.shared-preference.read-only</key>
 	<array>

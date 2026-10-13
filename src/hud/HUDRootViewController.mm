@@ -8,7 +8,6 @@
 #import "Helium-Swift.h"
 
 #import "../widgets/WidgetManager.h"
-#import "../widgets/CPUMetricsPublisher.h"
 #import "../extensions/UsefulFunctions.h"
 #import "../extensions/FontUtils.h"
 #import "../extensions/EZTimer.h"
@@ -100,7 +99,7 @@ static void LaunchServicesApplicationStateChanged
     
     for (LSApplicationProxy *app in [[objc_getClass("LSApplicationWorkspace") defaultWorkspace] allApplications])
     {
-        if ([app.applicationIdentifier isEqualToString:@"com.leemin.helium"])
+        if ([app.applicationIdentifier isEqualToString:@"com.corin.Statusbar"])
         {
             isAppInstalled = YES;
             break;
@@ -492,9 +491,9 @@ static CFAbsoluteTime gLastReloadStamp = 0;
     helium_dbg(@"viewDidLoad views created: blur=%lu label=%lu backdrop=%lu mask=%lu",
                (unsigned long)_blurViews.count, (unsigned long)_labelViews.count,
                (unsigned long)_backdropViews.count, (unsigned long)_maskLabelViews.count);
-    // Publish this HUD's CPU readings to the shared file so SysProbe can show the
-    // same numbers instead of sampling on its own (see CPUMetricsPublisher.mm).
-    helium_start_cpu_metrics_publisher();
+    // 0.31：这里原来会启动「共享指标发布器」，把 CPU 占用与频率写进
+    // /var/tmp/cpu_metrics.json 供 SysProbe 读。那条路已整段删除 ——
+    // 两个 App 现在各自读 IOReport，谁也不依赖谁。
     // 启动兜底（0.29）：「部件要手动调一次设置才出现」的根因还没定位（本版日志就
     // 是为它准备的），在那之前先用笨办法兜住 —— 启动后把同一次 reload 再补跑两遍。
     // performReload 幂等（去重窗口只拦 200ms 内的重跑），多跑的代价是几次 plist 读
@@ -708,7 +707,10 @@ static CFAbsoluteTime gLastReloadStamp = 0;
     // 负一屏不可能在屏幕上。所以这一整条链在锁屏期间是纯耗电。
     //
     // 解锁时 `resumeLoopTimer` 会把它恢复并立刻补一拍，见那里的注释。
-    helium_set_cpu_metrics_publisher_paused(YES);
+    //
+    // 0.31：原来这里还会暂停「共享指标发布器」（它有自己的 1 Hz 定时器，锁屏期间
+    // 照跑）。那个发布器已删除，频率采样改由部件渲染驱动 —— 渲染定时器一停，
+    // 采样自然跟着停，不需要单独暂停。
 }
 
 - (void)resumeLoopTimer
@@ -721,8 +723,7 @@ static CFAbsoluteTime gLastReloadStamp = 0;
         [[EZTimer shareInstance] resume:[NSString stringWithFormat:@"widgetset%d", i]];
     }
 
-    // 恢复发布器；它内部会立刻补一次发布，所以文件在解锁的那一刻就是新鲜的。
-    helium_set_cpu_metrics_publisher_paused(NO);
+    // 0.31：不再需要恢复发布器 —— 它已删除，频率采样跟着渲染定时器走。
 }
 
 - (void)viewSafeAreaInsetsDidChange

@@ -1,5 +1,5 @@
-Package: com.leemin.helium
-Name: Helium
+Package: com.corin.statusbar
+Name: Statusbar
 Version: 1.0
 Section: Tweaks
 Depends: firmware (>= 13.0), mobilesubstrate (>= 0.9.7000), com.rpetrich.rocketbootstrap (>= 1.0.9)

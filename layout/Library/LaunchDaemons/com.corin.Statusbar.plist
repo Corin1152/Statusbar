@@ -13,7 +13,7 @@
 	<key>KeepAlive</key>
 	<true/>
 	<key>Label</key>
-	<string>com.leemin.helium</string>
+	<string>com.corin.Statusbar</string>
 	<key>POSIXSpawnType</key>
 	<string>App</string>
 	<key>ProcessType</key>

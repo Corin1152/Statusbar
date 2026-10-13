@@ -60,8 +60,6 @@
 #import <time.h>
 #import <unistd.h>   // getuid — IOReport subscription requires root
 
-#import "CPUFrequencyProbe.h"   // helium_measure_cpu_frequency_mhz — 0.17 self-check
-
 /// The device-tree plane name. Written as a literal because the SDK constant is
 /// not exported on iOS.
 static const char *const kDeviceTreePlane = "IODeviceTree";
@@ -851,11 +849,8 @@ NSString *helium_real_cpu_frequency_diagnosis(void)
     [out appendString:@"Self-check:\n"];
     [out appendFormat:@"  uid=%d gid=%d euid=%d\n", getuid(), getgid(), geteuid()];
     appendOwnEntitlements(out);
-    [out appendString:@"  Busy-loop probe samples (2 threads x ~62 ms per sample):\n"];
-    for (int i = 0; i < 5; i++) {
-        uint64_t m = helium_measure_cpu_frequency_mhz();
-        [out appendFormat:@"     sample %d: %llu MHz\n", i + 1, m];
-    }
+    // 忙循环样本已删（0.31）：探针不再使用，诊断里也没必要再烧一次 2 × 62 ms 的
+    // user-interactive 忙循环。
     [out appendString:@"  Shared file readings:\n"];
     appendSharedFileCheck(out);
     appendWholeSetSubscribeCheck(out);
