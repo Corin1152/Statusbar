@@ -122,14 +122,20 @@
 	<key>com.apple.private.sysdiagnose</key>
 	<true/>
 	<!--
-	  IOReport 读真实 CPU 频率 / 温度需要此私有权限。iOS 上 IOReport 订阅
-	  不仅要求调用进程是 root（HUD 守护进程满足），还要求该 entitlement，
-	  否则每个 group 都 subscribe=REFUSED（见 HeliumCPUFreqDiag(3).txt）。
-	  TrollStore 放行任意私有权限，签名带上即可由 HUD(root) 订阅 CPU Stats，
-	  读出真实 DVFS 驻留算实时频率；CPU 温度部件也可能从 ??ºC 变可用。
-	  这是 wildcard，允许所有 IOReport 组（SiliconScope / macmon 同款）。
+	  IOReport 的订阅在 iOS 上是被 IOKit 那一层门住的，不是这里。
+
+	  `platform-application` 会让「每一个 IOKit user client 都要显式例外」
+	  （TrollStore README 原文），IOReport 走的正是 IOReportUserClient ——
+	  它必须出现在下面那份 iokit-user-client-class 里，否则每个 group 都
+	  subscribe=REFUSED，与任何 ioreport 前缀的 entitlement 都无关。
+
+	  ⚠️ 此前挂在这儿的 `com.apple.private.ioreport.allow` 是**臆测的名字**：
+	  全 GitHub 检索 0 条，Apple 的 entitlement 库里并不存在，所以它一直是个
+	  空操作 —— 真正的缺口是 IOReportUserClient。真实存在的是
+	  `com.apple.private.ioreporting.access`（Apple 的 perfpowermetricd /
+	  powerlogHelperd 在用），一并带上。
 	-->
-	<key>com.apple.private.ioreport.allow</key>
+	<key>com.apple.private.ioreporting.access</key>
 	<true/>
 	<key>com.apple.private.ubiquity-additional-kvstore-identifiers</key>
 	<array>
@@ -185,6 +191,7 @@
 		<string>IOSurfaceRootUserClient</string>
 		<string>AGXDeviceUserClient</string>
 		<string>IOPMPowerSourceClient</string>
+		<string>IOReportUserClient</string>
 	</array>
 	<key>com.apple.security.system-groups</key>
 	<array>
