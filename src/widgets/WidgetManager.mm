@@ -974,7 +974,7 @@ static dispatch_queue_t cpuTempQueue(void)
     static dispatch_once_t once;
     static dispatch_queue_t queue = NULL;
     dispatch_once(&once, ^{
-        queue = dispatch_queue_create("com.leemin.helium.cputemp", DISPATCH_QUEUE_SERIAL);
+        queue = dispatch_queue_create("com.corin.Statusbar.cputemp", DISPATCH_QUEUE_SERIAL);
     });
     return queue;
 }
@@ -1053,18 +1053,16 @@ static NSString* formattedCPUTemp(BOOL useFahrenheit)
      formatter is otherwise a pure function, so the previous sample lives in a
      static — the same trick the network widget already uses for prevOutputBytes.
 
-   * The clock has to be *measured* with a busy loop (see CPUFrequencyProbe.mm),
-     which blocks for ~15-20 ms. That must never happen on the HUD's render path,
-     so it is sampled on its own queue at a fixed cadence and the formatter only
-     ever reads the cached value.
+   * The clock comes from IOReport (see CPUFrequencyReal.mm): CLPC 的 per-state
+     residency 加权平均。它只读计数器、不占性能核，但仍会阻塞约 100 ms
+     （两次采样之间的差分窗口），所以同样绝不能放在 HUD 的渲染路径上 ——
+     在独立队列上按固定节拍采样，formatter 只读缓存。
 
- Neither needs a new entitlement — host_processor_info and inline assembly are both
- open to a jailed app. (The CPU temperature widget next door does need no-sandbox,
- because IOReport does. The two are unrelated.)
+ Neither needs a new entitlement — host_processor_info 对沙箱 App 是开放的，
+ 而 IOReport 走的是 `IOReportUserClient`（见 CPUFrequencyIOReport 的说明）。
  */
 
 #import <mach/mach.h>
-#import "CPUFrequencyProbe.h"
 
 // MARK: - CPU load
 
@@ -1269,7 +1267,7 @@ static dispatch_queue_t cpuFrequencyQueue(void)
     static dispatch_once_t once;
     static dispatch_queue_t queue = NULL;
     dispatch_once(&once, ^{
-        queue = dispatch_queue_create("com.leemin.helium.cpufreq", DISPATCH_QUEUE_SERIAL);
+        queue = dispatch_queue_create("com.corin.Statusbar.cpufreq", DISPATCH_QUEUE_SERIAL);
     });
     return queue;
 }
@@ -1392,7 +1390,7 @@ static dispatch_queue_t cellularSignalQueue(void)
     static dispatch_once_t once;
     static dispatch_queue_t queue = NULL;
     dispatch_once(&once, ^{
-        queue = dispatch_queue_create("com.leemin.helium.cellularsignal", DISPATCH_QUEUE_SERIAL);
+        queue = dispatch_queue_create("com.corin.Statusbar.cellularsignal", DISPATCH_QUEUE_SERIAL);
     });
     return queue;
 }
@@ -1428,7 +1426,7 @@ static dispatch_queue_t wifiSignalQueue(void)
     static dispatch_once_t once;
     static dispatch_queue_t queue = NULL;
     dispatch_once(&once, ^{
-        queue = dispatch_queue_create("com.leemin.helium.wifisignal", DISPATCH_QUEUE_SERIAL);
+        queue = dispatch_queue_create("com.corin.Statusbar.wifisignal", DISPATCH_QUEUE_SERIAL);
     });
     return queue;
 }

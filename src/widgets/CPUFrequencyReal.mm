@@ -691,27 +691,9 @@ static void appendOwnEntitlements(NSMutableString *out)
     }
 }
 
-// The shared file the frequency widget actually renders. Shows whether the value
-// on screen is the probe's or a real IOReport reading.
-static void appendSharedFileCheck(NSMutableString *out)
-{
-    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-    for (NSString *path in @[ @"/var/tmp/cpu_metrics.json",
-                              @"/var/mobile/Library/Caches/cpu_metrics.json" ]) {
-        NSData *d = [NSData dataWithContentsOfFile:path];
-        if (!d) { [out appendFormat:@"     %@ : (missing)\n", path]; continue; }
-        NSDictionary *j = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
-        if (![j isKindOfClass:[NSDictionary class]]) {
-            [out appendFormat:@"     %@ : (unparseable)\n", path];
-            continue;
-        }
-        NSTimeInterval ts = [j[@"ts"] doubleValue];
-        NSArray *pc = [j[@"per_core"] isKindOfClass:[NSArray class]] ? j[@"per_core"] : @[];
-        [out appendFormat:@"     %@ : freq_mhz=%@ freq_source=%@ writer=%@ age=%.1fs usage=%@ per_core=%lu\n",
-            path, j[@"freq_mhz"], j[@"freq_source"], j[@"writer"], now - ts,
-            j[@"usage"], (unsigned long)pc.count];
-    }
-}
+// 0.31：`appendSharedFileCheck` 已删除 —— 它读的
+// /var/tmp/cpu_metrics.json 与 Caches 备用路径都随共享文件机制一起拿掉了，
+// 现在两个 App 各自读 IOReport，没有「文件里写的到底是探针值还是真实值」这个问题。
 
 // Try subscribing to the WHOLE channel set (IOReportCopyAllChannels) — a
 // different code path from the per-group subscribe used elsewhere, and the one
@@ -849,10 +831,7 @@ NSString *helium_real_cpu_frequency_diagnosis(void)
     [out appendString:@"Self-check:\n"];
     [out appendFormat:@"  uid=%d gid=%d euid=%d\n", getuid(), getgid(), geteuid()];
     appendOwnEntitlements(out);
-    // 忙循环样本已删（0.31）：探针不再使用，诊断里也没必要再烧一次 2 × 62 ms 的
-    // user-interactive 忙循环。
-    [out appendString:@"  Shared file readings:\n"];
-    appendSharedFileCheck(out);
+    // 忙循环样本与共享文件读数都已删（0.31）：探针不再使用，共享文件机制也已拆除。
     appendWholeSetSubscribeCheck(out);
     [out appendString:@"\n"];
 
