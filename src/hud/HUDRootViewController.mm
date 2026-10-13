@@ -44,16 +44,18 @@ static CFAbsoluteTime gHeliumLogStart = 0;
 /// 打开后也不会再出现「忘记清理」的问题。
 #define HELIUM_HUD_DEBUG_LOG 0
 
-/// 日志路径与大小上限（仅在开关打开时使用）。
-static const char *const kHeliumLogPath = "/var/mobile/Library/Preferences/helium_hud_debug.log";
-static const unsigned long long kHeliumLogMaxBytes = 2ull * 1024 * 1024;
-
 static void helium_dbg(NSString *fmt, ...)
 {
 #if !HELIUM_HUD_DEBUG_LOG
+    // 关掉时连变量一起省掉 —— 否则 -Werror 会把它们当成 unused-variable 报错
+    // （这个 target 开着 -Wunused-const-variable / -Wunused-variable）。
     (void)fmt;
     return;
 #else
+    static const char *const kHeliumLogPath = "/var/mobile/Library/Preferences/helium_hud_debug.log";
+    static const unsigned long long kHeliumLogMaxBytes = 2ull * 1024 * 1024;
+    static CFAbsoluteTime gHeliumLogStart = 0;
+
     // 每 256 条查一次大小 —— 每条都 stat 的话，光这一项就够把渲染拖慢。
     static unsigned int sinceSizeCheck = 0;
     if (++sinceSizeCheck >= 256) {
