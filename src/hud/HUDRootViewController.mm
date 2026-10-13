@@ -1,5 +1,7 @@
 #import <notify.h>
 #import <objc/runtime.h>
+#import <sys/stat.h>   // stat —— 诊断日志的大小上限
+#import <unistd.h>     // unlink
 
 #import "HUDRootViewController.h"
 #import "AnyBackdropView.h"
@@ -32,9 +34,30 @@
 /// 单独 fopen/fclose，代价是每条一次 open，换来「绝不丢日志」—— 诊断优先。
 static CFAbsoluteTime gHeliumLogStart = 0;
 
+/// 日志路径与大小上限。
+///
+/// **上限是必须的**：这份日志挂在渲染路径上，稳态里每秒要写十几条（每个部件
+/// 每帧一条），实测不到一天就到 32 MB / 41 万行 —— 而它是 root 写的、没人清理，
+/// 只会一直涨。2 MB 足够放下「最近一次复现」的完整时间轴；超过就把文件删掉重来
+/// （这是诊断日志、不是审计日志，不需要留档）。
+static const char *const kHeliumLogPath = "/var/mobile/Library/Preferences/helium_hud_debug.log";
+static const unsigned long long kHeliumLogMaxBytes = 2ull * 1024 * 1024;
+
 static void helium_dbg(NSString *fmt, ...)
 {
-    FILE *f = fopen("/var/mobile/Library/Preferences/helium_hud_debug.log", "a");
+    // 每 256 条查一次大小 —— 每条都 stat 的话，光这一项就够把渲染拖慢。
+    static unsigned int sinceSizeCheck = 0;
+    if (++sinceSizeCheck >= 256) {
+        sinceSizeCheck = 0;
+        struct stat st;
+        if (stat(kHeliumLogPath, &st) == 0 &&
+            (unsigned long long)st.st_size > kHeliumLogMaxBytes) {
+            unlink(kHeliumLogPath);
+            gHeliumLogStart = 0.0;   // 时间轴跟着新文件重新起算
+        }
+    }
+
+    FILE *f = fopen(kHeliumLogPath, "a");
     if (!f)
         return;
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
@@ -619,7 +642,9 @@ static CFAbsoluteTime gLastReloadStamp = 0;
         // `autoResizes == NO` 时 frame 是按设置里的宽高**显式**写的，那个值可能在
         // 两次调用之间被改过，所以这里还要再比一次尺寸。
         if (autoResizes || CGSizeEqualToSize(maskLabel.frame.size, CGSizeMake(width, height))) {
-            helium_dbg(@"updateLabel: cache hit (label=%d mask=%d), skip", labelChanged, maskChanged);
+            // 这里**故意不记日志**：稳态里每帧都会走到，写下来只是把文件再撑大一截，
+            // 而它对定位问题没有贡献 ——「跳过了」本身不是异常。有价值的是下面那条
+            // draw，它才记录「画了什么」。
             return;
         }
     }
