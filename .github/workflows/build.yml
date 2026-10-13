@@ -99,9 +99,25 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: statusbar-${{ github.run_number }}
-          name: Statusbar 0.30 (build ${{ github.run_number }})
+          name: Statusbar 0.31 (build ${{ github.run_number }})
           body: |
-            基于 Helium 改版。应用名改为 Statusbar，版本从 0.01 起（本次 0.30）。
+            基于 Helium 改版。应用名改为 Statusbar，版本从 0.01 起（本次 0.31）。
+
+            本次改动（0.31：CPU 频率改用 IOReport 真实档位 + 关闭诊断日志）：
+
+              · **CPU 频率改走 IOReport 的真实 DVFS 档位**。iOS 上
+                `platform-application` 会让「每一个 IOKit user client 都要显式例外」
+                （TrollStore README 原文），而 IOReport 走的正是 `IOReportUserClient`
+                —— 它一直不在 iokit-user-client-class 里，所以每个 group 都
+                subscribe=REFUSED。补上之后所有 CPU group 均 subscribe=ok，读的是
+                CLPC 的 per-state residency 加权平均（A11 实测 453…2376 MHz，
+                随负载变化），不再是「能跑多快」的忙循环峰值。
+              · 部件频率刷新从 5 s 提到 **1 s**：IOReport 只读计数器，成本可忽略；
+                万一回落到忙循环探针，间隔自动退回 5 s（那条会抢前台）。
+              · **诊断日志 `helium_hud_debug.log` 默认关闭**。它 0.29 为定位
+                「部件不显示」而加，0.30 已修复；实测不到一天 32.6 MB / 41.5 万行，
+                且由 root 写、无人清理。开关在 `HUDRootViewController.mm` 顶部，
+                需要复现时改成 1 即可（2 MB 上限仍在）。
 
             界面：只有「首页 / 自定义」两页，首页右上角直接显示版本号（无齿轮/设置入口）。
             部件：原有 9 个 + CPU温度 / CPU占用 / CPU频率 / 蜂窝信号（RSRP）。

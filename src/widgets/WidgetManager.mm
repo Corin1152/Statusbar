@@ -14,7 +14,9 @@
 #import <objc/runtime.h>
 #import <os/lock.h>
 #import "WidgetManager.h"
+#import "CPUFrequencyReal.h"   // helium_real_cpu_frequency_mhz —— IOReport 的真实频率
 #import <IOKit/IOKitLib.h>
+#import <unistd.h>            // getuid
 #import "../extensions/LunarDate.h"
 #import "../extensions/FontUtils.h"
 
@@ -1266,25 +1268,25 @@ static CFAbsoluteTime gCPUFrequencyWantedStamp = 0;
 /// arm64 and it is only ever a readout hint.
 static os_unfair_lock gCPUFrequencyLock = OS_UNFAIR_LOCK_INIT;
 
+// 上一次采样实际走的是哪条路 —— 间隔跟着它变。
+static BOOL gCPUFrequencyViaIOReport = NO;
+
 // How long a measured clock stays usable.
 //
-// Two reasons this is seconds rather than "every redraw". The obvious one is cost:
-// the probe is a ~62 ms busy loop on each performance core (50 ms warm-up + 12 ms of
-// measured rounds, two threads — see CPUFrequencyProbe.mm), so running it per second
-// would spend about 12 % of the performance cluster forever.
+// **两条来源的成本差两个数量级，间隔必须分开**（0.31）：
 //
-// The other one is that the probe would be measuring its own effect. It raises the
-// clock on the cores it lands on in order to read a meaningful number, so sampling
-// it every second would keep the CPU boosted — the widget would be causing part of
-// the load it reports, and the battery cost of a status-bar readout would be real.
-// Between samples the readout repeats the last measurement, which is what every
-// other monitor does too.
+//   · IOReport（首选，`helium_real_cpu_frequency_mhz()`）：只读 CLPC 的
+//     per-state residency 计数器再算加权平均，成本可忽略、也不占性能核 ——
+//     1 s 一次没有代价，读数还更跟手。
+//   · 忙循环探针（回落，`helium_measure_cpu_frequency_mhz()`）：2 × 62 ms 的
+//     user-interactive 忙循环（50 ms 预热 + 12 ms 测量，两条线程，见
+//     CPUFrequencyProbe.mm）。它会抢占前台，而且会把它测的那两个核顶到最高频 ——
+//     采得越勤，它自己制造的负载就越多。所以这条仍然保持 5 s。
 //
-// 5 s rather than the old 3 s: same reasoning, taken a step further. The probe is
-// also what made the device warm, and it runs at user-interactive QoS so it can
-// preempt the foreground UI — sampling it less often is a straight win on both.
-// At 5 s the two threads together come to ~2.5 % of the performance cluster.
-#define CPU_FREQUENCY_SAMPLE_SECONDS 5.0
+// 原来只有探针一条路，所以只有下面那一档；5 s 是从 3 s 提上来的（探针也是让机器
+// 发热的那件事）。A11 上两条线程合计约占性能簇的 2.5 %。
+#define CPU_FREQUENCY_SAMPLE_SECONDS_REAL  1.0
+#define CPU_FREQUENCY_SAMPLE_SECONDS_PROBE 5.0
 
 static dispatch_queue_t cpuFrequencyQueue(void)
 {
@@ -1313,8 +1315,9 @@ static void cpuFrequencyScheduleIfStale(void)
     // **twice**, burning 62 ms on two performance cores for nothing and letting the
     // two probes steal each other's cores, which drags both readings down.
     os_unfair_lock_lock(&gCPUFrequencyLock);
-    BOOL stale = (!gCPUFrequencySampling
-                  && (now - gCPUFrequencyStamp) >= CPU_FREQUENCY_SAMPLE_SECONDS);
+    double interval = gCPUFrequencyViaIOReport ? CPU_FREQUENCY_SAMPLE_SECONDS_REAL
+                                               : CPU_FREQUENCY_SAMPLE_SECONDS_PROBE;
+    BOOL stale = (!gCPUFrequencySampling && (now - gCPUFrequencyStamp) >= interval);
     if (stale) {
         gCPUFrequencySampling = YES;
     }
@@ -1325,9 +1328,22 @@ static void cpuFrequencyScheduleIfStale(void)
     }
 
     dispatch_async(cpuFrequencyQueue(), ^{
-        uint64_t megahertz = helium_measure_cpu_frequency_mhz();
+        // 首选 IOReport 的真实 DVFS 加权频率：便宜、不占核，所以能按 1 s 采。
+        // 拿不到（订阅被拒 / 采样窗口全 IDLE / 表缺失）再回落到忙循环探针 ——
+        // 那条贵且抢前台，`gCPUFrequencyViaIOReport` 会让它退回 5 s 的节奏。
+        uint64_t megahertz = 0;
+        BOOL viaReal = NO;
+        if (getuid() == 0) {
+            megahertz = helium_real_cpu_frequency_mhz();
+            viaReal = (megahertz > 0);
+        }
+        if (megahertz == 0) {
+            megahertz = helium_measure_cpu_frequency_mhz();
+        }
+
         os_unfair_lock_lock(&gCPUFrequencyLock);
-        gCPUFrequencyKHz = megahertz * 1000ull;   // 0 on failure; retried in 5 s
+        gCPUFrequencyKHz = megahertz * 1000ull;   // 0 on failure; retried next tick
+        gCPUFrequencyViaIOReport = viaReal;
         gCPUFrequencyStamp = CFAbsoluteTimeGetCurrent();
         gCPUFrequencySampling = NO;
         os_unfair_lock_unlock(&gCPUFrequencyLock);

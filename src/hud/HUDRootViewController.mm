@@ -34,17 +34,26 @@
 /// 单独 fopen/fclose，代价是每条一次 open，换来「绝不丢日志」—— 诊断优先。
 static CFAbsoluteTime gHeliumLogStart = 0;
 
-/// 日志路径与大小上限。
+/// 诊断日志开关：**0 = 关闭（0.31 起默认）**，1 = 打开。
 ///
-/// **上限是必须的**：这份日志挂在渲染路径上，稳态里每秒要写十几条（每个部件
-/// 每帧一条），实测不到一天就到 32 MB / 41 万行 —— 而它是 root 写的、没人清理，
-/// 只会一直涨。2 MB 足够放下「最近一次复现」的完整时间轴；超过就把文件删掉重来
-/// （这是诊断日志、不是审计日志，不需要留档）。
+/// 这份日志是 0.29 为定位「启用 HUD 后部件要手动调一次设置才出现」加的，0.30 已修复，
+/// 使命结束。而它挂在渲染路径上、稳态每秒十几条，又是 root 写的、没人清理 ——
+/// 实测不到一天就 32.6 MB / 415,706 行，只会一直涨。留着等于持续往用户磁盘里灌数据。
+///
+/// 需要再复现时把这里改成 1 重编即可；下面的大小上限（2 MB）与全部调用点都保留，
+/// 打开后也不会再出现「忘记清理」的问题。
+#define HELIUM_HUD_DEBUG_LOG 0
+
+/// 日志路径与大小上限（仅在开关打开时使用）。
 static const char *const kHeliumLogPath = "/var/mobile/Library/Preferences/helium_hud_debug.log";
 static const unsigned long long kHeliumLogMaxBytes = 2ull * 1024 * 1024;
 
 static void helium_dbg(NSString *fmt, ...)
 {
+#if !HELIUM_HUD_DEBUG_LOG
+    (void)fmt;
+    return;
+#else
     // 每 256 条查一次大小 —— 每条都 stat 的话，光这一项就够把渲染拖慢。
     static unsigned int sinceSizeCheck = 0;
     if (++sinceSizeCheck >= 256) {
@@ -69,6 +78,7 @@ static void helium_dbg(NSString *fmt, ...)
     va_end(args);
     fprintf(f, "[t+%.3f] %s\n", now - gHeliumLogStart, msg.UTF8String);
     fclose(f);
+#endif
 }
 
 /// 上一次真正画上去的文本，挂在**当时可见的那个** label 上。

@@ -245,13 +245,13 @@ void helium_start_cpu_metrics_publisher(void)
         dispatch_queue_t diagQueue = dispatch_queue_create("com.leemin.helium.cpudiag",
                                                            DISPATCH_QUEUE_SERIAL);
         dispatch_async(diagQueue, ^{
-            // 排查期临时改动：不再要求 /var/mobile/Documents/HeliumCPUFreqDiag.enable，
-            // HUD 每次启动都跑一次诊断并落盘到
-            //   /var/mobile/Documents/HeliumCPUFreqDiag.txt
-            //   /var/mobile/Media/Downloads/HeliumCPUFreqDiag.txt
-            // 目的是确认 IOReportUserClient 补上之后订阅到底成不成、通道是什么格式。
-            // 诊断自身有保护：非 root 进程不会覆盖已存在的成功报告，重复跑无副作用。
-            // 验证完请把这段还原成原来的 enable 文件判断。
+            // **按需触发**：只有这个文件存在时才跑，跑完不删 —— 要再看就再建一次。
+            // 诊断会枚举 6000+ 个通道、对每个 CPU 相关 group 尝试订阅，不该每次启动都做。
+            // 它原本的用途（定位 IOReport 订阅为什么被拒）在 0.31 已完成；留着这条路径
+            // 是为了「换机型 / 换系统版本后重新核对通道结构」这种场合。
+            if (![[NSFileManager defaultManager] fileExistsAtPath:@"/var/mobile/Documents/HeliumCPUFreqDiag.enable"]) {
+                return;
+            }
             @try { (void)helium_real_cpu_frequency_diagnosis(); } @catch (NSException *e) { }
         });
 
