@@ -23,16 +23,7 @@
 #define NOTIFY_UI_LOCKSTATE    "com.apple.springboard.lockstate"
 #define NOTIFY_LS_APP_CHANGED  "com.apple.LaunchServices.ApplicationsChanged"
 
-#pragma mark - Diagnostic log (0.29)
-
-/// 「启用 HUD 后部件要手动调一次设置才出现」的根因到现在还没定位到 —— 这份日志就
-/// 是为它准备的：把启动、reload、定时器建立、每次渲染写入的全部决策点按时间轴落到
-/// 文件里，用户复现一次后拿回来对表。定位完成后整段移除。
-///
-/// 追加写 `/var/mobile/Library/Preferences/helium_hud_debug.log`：HUD 是 root + 
-/// no-sandbox，写这里没有沙盒问题；mobile 侧也能读，Filza 直接可以看。每次调用
-/// 单独 fopen/fclose，代价是每条一次 open，换来「绝不丢日志」—— 诊断优先。
-static CFAbsoluteTime gHeliumLogStart = 0;
+#pragma mark - Diagnostic log (0.29 引入，0.31 起默认关闭)
 
 /// 诊断日志开关：**0 = 关闭（0.31 起默认）**，1 = 打开。
 ///
