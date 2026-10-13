@@ -747,6 +747,67 @@ static void appendWholeSetSubscribeCheck(NSMutableString *out)
     }
 }
 
+// Why the real reading still comes out 0 even though every group subscribes.
+// Walks the exact same chain helium_real_cpu_frequency_mhz() walks, printing
+// every step, so a 0 can be pinned to one of: samples NULL, delta NULL, no
+// channel named PCPU/ECPU, all-zero residency, or an empty weighted sum.
+static void appendRealFreqDetail(NSMutableString *out)
+{
+    @try {
+        [out appendString:@"\nReal-frequency chain (same path as the widget):\n"];
+        for (int i = 0; i < 3; i++) {
+            uint64_t m = helium_real_cpu_frequency_mhz();
+            [out appendFormat:@"   helium_real_cpu_frequency_mhz() #%d = %llu MHz\n", i + 1, m];
+        }
+
+        [out appendFormat:@"   subscription: tried=%d ok=%d active=%@\n",
+            gSubscriptionTried, gSubscriptionOK, gActiveGroupDescription ?: @"?"];
+        [out appendFormat:@"   P table(%lu)=%@\n", (unsigned long)gPFreqs.count, gPFreqs ?: @"nil"];
+        [out appendFormat:@"   E table(%lu)=%@\n", (unsigned long)gEFreqs.count, gEFreqs ?: @"nil"];
+
+        if (!gSubscription || !gSubscribedChannels) {
+            [out appendString:@"   (no subscription object — cannot sample)\n"];
+            return;
+        }
+
+        CFDictionaryRef s1 = pCreateSamples(gSubscription, gSubscribedChannels, NULL);
+        [out appendFormat:@"   s1=%s\n", s1 ? "ok" : "NULL"];
+        if (!s1) return;
+
+        struct timespec ts = { 0, 100 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+        CFDictionaryRef s2 = pCreateSamples(gSubscription, gSubscribedChannels, NULL);
+        [out appendFormat:@"   s2=%s\n", s2 ? "ok" : "NULL"];
+        if (!s2) { CFRelease(s1); return; }
+
+        CFDictionaryRef delta = pCreateSamplesDelta(s1, s2, NULL);
+        [out appendFormat:@"   delta=%s\n", delta ? "ok" : "NULL"];
+        if (delta) {
+            NSArray *chans = copyChannelsArrayFromSample(delta);
+            [out appendFormat:@"   delta channels=%lu\n", (unsigned long)chans.count];
+            for (id item in chans) {
+                if (![item isKindOfClass:[NSDictionary class]]) continue;
+                CFDictionaryRef metric = (__bridge CFDictionaryRef)item;
+                CFStringRef cfName = pChannelGetChannelName ? pChannelGetChannelName(metric) : NULL;
+                NSString *name = cfName ? (__bridge NSString *)cfName : @"?";
+                int states = pStateGetCount ? pStateGetCount(metric) : 0;
+                NSMutableString *res = [NSMutableString string];
+                for (int i = 0; i < states && i < 12; i++) {
+                    [res appendFormat:@"%lld,", (long long)pStateGetResidency(metric, i)];
+                }
+                [out appendFormat:@"      %@ states=%d residency=[%@]\n", name, states, res];
+            }
+            ClusterClocks c = clocksFromDelta(delta, gPFreqs, gEFreqs);
+            [out appendFormat:@"   computed: P=%.1f MHz  E=%.1f MHz\n", c.pClusterMHz, c.eClusterMHz];
+            CFRelease(delta);
+        }
+        CFRelease(s2);
+        CFRelease(s1);
+    } @catch (NSException *e) {
+        [out appendFormat:@"   real-freq chain failed: %@\n", e.reason];
+    }
+}
+
 NSString *helium_real_cpu_frequency_diagnosis(void)
 {
     // Write a fresh report on every run, with one exception: a NON-ROOT process must
@@ -896,6 +957,7 @@ NSString *helium_real_cpu_frequency_diagnosis(void)
                         name, states, [stateNames componentsJoinedByString:@","]];
                 }
                 if (s) CFRelease(s);
+                appendRealFreqDetail(out);
             } else {
                 [out appendString:@"\nNo group could be subscribed to — the real-frequency path is unavailable.\n"];
             }
