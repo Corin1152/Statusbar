@@ -1,13 +1,13 @@
 #import <notify.h>
 #import <objc/runtime.h>
-#import <sys/stat.h>   // stat —— 诊断日志的大小上限
-#import <unistd.h>     // unlink
 
 #import "HUDRootViewController.h"
 #import "AnyBackdropView.h"
 #import "Helium-Swift.h"
 
 #import "../widgets/WidgetManager.h"
+#import "../widgets/CPUMetricsPublisher.h"
+#import "../widgets/CPUFrequencyGovernor.h"
 #import "../extensions/UsefulFunctions.h"
 #import "../extensions/FontUtils.h"
 #import "../extensions/EZTimer.h"
@@ -22,43 +22,20 @@
 #define NOTIFY_UI_LOCKSTATE    "com.apple.springboard.lockstate"
 #define NOTIFY_LS_APP_CHANGED  "com.apple.LaunchServices.ApplicationsChanged"
 
-#pragma mark - Diagnostic log (0.29 引入，0.31 起默认关闭)
+#pragma mark - Diagnostic log (0.29)
 
-/// 诊断日志开关：**0 = 关闭（0.31 起默认）**，1 = 打开。
+/// 「启用 HUD 后部件要手动调一次设置才出现」的根因到现在还没定位到 —— 这份日志就
+/// 是为它准备的：把启动、reload、定时器建立、每次渲染写入的全部决策点按时间轴落到
+/// 文件里，用户复现一次后拿回来对表。定位完成后整段移除。
 ///
-/// 这份日志是 0.29 为定位「启用 HUD 后部件要手动调一次设置才出现」加的，0.30 已修复，
-/// 使命结束。而它挂在渲染路径上、稳态每秒十几条，又是 root 写的、没人清理 ——
-/// 实测不到一天就 32.6 MB / 415,706 行，只会一直涨。留着等于持续往用户磁盘里灌数据。
-///
-/// 需要再复现时把这里改成 1 重编即可；下面的大小上限（2 MB）与全部调用点都保留，
-/// 打开后也不会再出现「忘记清理」的问题。
-#define HELIUM_HUD_DEBUG_LOG 0
+/// 追加写 `/var/mobile/Library/Preferences/helium_hud_debug.log`：HUD 是 root + 
+/// no-sandbox，写这里没有沙盒问题；mobile 侧也能读，Filza 直接可以看。每次调用
+/// 单独 fopen/fclose，代价是每条一次 open，换来「绝不丢日志」—— 诊断优先。
+static CFAbsoluteTime gHeliumLogStart = 0;
 
 static void helium_dbg(NSString *fmt, ...)
 {
-#if !HELIUM_HUD_DEBUG_LOG
-    // 关掉时连变量一起省掉 —— 否则 -Werror 会把它们当成 unused-variable 报错
-    // （这个 target 开着 -Wunused-const-variable / -Wunused-variable）。
-    (void)fmt;
-    return;
-#else
-    static const char *const kHeliumLogPath = "/var/mobile/Library/Preferences/helium_hud_debug.log";
-    static const unsigned long long kHeliumLogMaxBytes = 2ull * 1024 * 1024;
-    static CFAbsoluteTime gHeliumLogStart = 0;
-
-    // 每 256 条查一次大小 —— 每条都 stat 的话，光这一项就够把渲染拖慢。
-    static unsigned int sinceSizeCheck = 0;
-    if (++sinceSizeCheck >= 256) {
-        sinceSizeCheck = 0;
-        struct stat st;
-        if (stat(kHeliumLogPath, &st) == 0 &&
-            (unsigned long long)st.st_size > kHeliumLogMaxBytes) {
-            unlink(kHeliumLogPath);
-            gHeliumLogStart = 0.0;   // 时间轴跟着新文件重新起算
-        }
-    }
-
-    FILE *f = fopen(kHeliumLogPath, "a");
+    FILE *f = fopen("/var/mobile/Library/Preferences/helium_hud_debug.log", "a");
     if (!f)
         return;
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
@@ -70,7 +47,6 @@ static void helium_dbg(NSString *fmt, ...)
     va_end(args);
     fprintf(f, "[t+%.3f] %s\n", now - gHeliumLogStart, msg.UTF8String);
     fclose(f);
-#endif
 }
 
 /// 上一次真正画上去的文本，挂在**当时可见的那个** label 上。
@@ -96,10 +72,15 @@ static void LaunchServicesApplicationStateChanged
     /* Application installed or uninstalled */
 
     BOOL isAppInstalled = NO;
-    
+
+    // 用自身的 bundle id，而不是硬编码：0.31 把 com.leemin.helium 改成
+    // com.corin.Statusbar 时这处漏了，于是 HUD 在收到「应用安装/卸载变化」时会
+    // 判定自己没装，然后 terminateWithSuccess —— 一次静默自杀，日志里什么都没有。
+    NSString *selfBundleID = [[NSBundle mainBundle] bundleIdentifier];
+
     for (LSApplicationProxy *app in [[objc_getClass("LSApplicationWorkspace") defaultWorkspace] allApplications])
     {
-        if ([app.applicationIdentifier isEqualToString:@"com.corin.Statusbar"])
+        if (selfBundleID && [app.applicationIdentifier isEqualToString:selfBundleID])
         {
             isAppInstalled = YES;
             break;
@@ -138,12 +119,22 @@ static void SpringBoardLockStatusChanged
         {
             [rootViewController.view setHidden:NO];
             [rootViewController resumeLoopTimer];
+
+            // 0.34 事件驱动预热：解锁是用户马上要开始交互的时刻，在这里打一段
+            // 短脉冲，比常驻保频便宜得多 —— 热预算落在真正要用的时候，而不是
+            // 全程空转。chirp 在 governor 关闭时是空操作。
+            helium_governor_suspend(NO);
+            helium_governor_chirp(700);
+
             helium_dbg(@"unlock: view unhidden + timers resumed");
         }
         else
         {
             [rootViewController pauseLoopTimer];
             [rootViewController.view setHidden:YES];
+
+            // 锁屏后没有任何东西能变流畅，继续保频只是纯耗电。
+            helium_governor_suspend(YES);
         }
     }
 }
@@ -273,7 +264,12 @@ static CFAbsoluteTime gLastReloadStamp = 0;
 - (void) reloadUserDefaults
 {
     [self loadUserDefaults: YES];
-    
+
+    // 0.34 CPU 保频（测试）。设置写在同一个 plist 里（键 cpuGovernorMode），
+    // App 改完发 NOTIFY_RELOAD_HUD，HUD 在这里重新应用。apply 是幂等的，
+    // 重复调用不会重复建线程。
+    helium_governor_apply((int)getIntFromDictKey(_userDefaults, @"cpuGovernorMode", 0));
+
     if ([self debugBorder]) {
         _contentView.layer.borderWidth = 1.0;
         [_horizontalLine setHidden:NO];
@@ -491,9 +487,9 @@ static CFAbsoluteTime gLastReloadStamp = 0;
     helium_dbg(@"viewDidLoad views created: blur=%lu label=%lu backdrop=%lu mask=%lu",
                (unsigned long)_blurViews.count, (unsigned long)_labelViews.count,
                (unsigned long)_backdropViews.count, (unsigned long)_maskLabelViews.count);
-    // 0.31：这里原来会启动「共享指标发布器」，把 CPU 占用与频率写进
-    // /var/tmp/cpu_metrics.json 供 SysProbe 读。那条路已整段删除 ——
-    // 两个 App 现在各自读 IOReport，谁也不依赖谁。
+    // Publish this HUD's CPU readings to the shared file so SysProbe can show the
+    // same numbers instead of sampling on its own (see CPUMetricsPublisher.mm).
+    helium_start_cpu_metrics_publisher();
     // 启动兜底（0.29）：「部件要手动调一次设置才出现」的根因还没定位（本版日志就
     // 是为它准备的），在那之前先用笨办法兜住 —— 启动后把同一次 reload 再补跑两遍。
     // performReload 幂等（去重窗口只拦 200ms 内的重跑），多跑的代价是几次 plist 读
@@ -644,9 +640,7 @@ static CFAbsoluteTime gLastReloadStamp = 0;
         // `autoResizes == NO` 时 frame 是按设置里的宽高**显式**写的，那个值可能在
         // 两次调用之间被改过，所以这里还要再比一次尺寸。
         if (autoResizes || CGSizeEqualToSize(maskLabel.frame.size, CGSizeMake(width, height))) {
-            // 这里**故意不记日志**：稳态里每帧都会走到，写下来只是把文件再撑大一截，
-            // 而它对定位问题没有贡献 ——「跳过了」本身不是异常。有价值的是下面那条
-            // draw，它才记录「画了什么」。
+            helium_dbg(@"updateLabel: cache hit (label=%d mask=%d), skip", labelChanged, maskChanged);
             return;
         }
     }
@@ -707,10 +701,7 @@ static CFAbsoluteTime gLastReloadStamp = 0;
     // 负一屏不可能在屏幕上。所以这一整条链在锁屏期间是纯耗电。
     //
     // 解锁时 `resumeLoopTimer` 会把它恢复并立刻补一拍，见那里的注释。
-    //
-    // 0.31：原来这里还会暂停「共享指标发布器」（它有自己的 1 Hz 定时器，锁屏期间
-    // 照跑）。那个发布器已删除，频率采样改由部件渲染驱动 —— 渲染定时器一停，
-    // 采样自然跟着停，不需要单独暂停。
+    helium_set_cpu_metrics_publisher_paused(YES);
 }
 
 - (void)resumeLoopTimer
@@ -723,7 +714,8 @@ static CFAbsoluteTime gLastReloadStamp = 0;
         [[EZTimer shareInstance] resume:[NSString stringWithFormat:@"widgetset%d", i]];
     }
 
-    // 0.31：不再需要恢复发布器 —— 它已删除，频率采样跟着渲染定时器走。
+    // 恢复发布器；它内部会立刻补一次发布，所以文件在解锁的那一刻就是新鲜的。
+    helium_set_cpu_metrics_publisher_paused(NO);
 }
 
 - (void)viewSafeAreaInsetsDidChange

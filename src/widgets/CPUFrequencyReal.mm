@@ -54,11 +54,14 @@
 
 #import <dlfcn.h>
 #import <mach/mach.h>
+#import <os/lock.h>
 #import <stdlib.h>
 #import <string.h>
 #import <sys/sysctl.h>
 #import <time.h>
 #import <unistd.h>   // getuid — IOReport subscription requires root
+
+#import "CPUFrequencyProbe.h"   // helium_measure_cpu_frequency_mhz — 0.17 self-check
 
 /// The device-tree plane name. Written as a literal because the SDK constant is
 /// not exported on iOS.
@@ -631,6 +634,77 @@ uint64_t helium_real_cpu_frequency_mhz(void)
 }
 
 // ---------------------------------------------------------------------------
+// Non-blocking reading and peak lookup (for the frequency governor)
+// ---------------------------------------------------------------------------
+//
+// `helium_real_cpu_frequency_mhz` above sleeps 100 ms between its two samples,
+// which is right for a status-bar readout (once per 5 s) and wrong for a control
+// loop that has to decide *before* each pulse. This variant keeps the previous
+// sample and diffs against it, so the caller's own cadence becomes the sampling
+// window. Below ~200 ms the residency delta is too small to be meaningful, so the
+// cached value is returned instead of a noisy one.
+
+static os_unfair_lock gFastLock = OS_UNFAIR_LOCK_INIT;
+static CFDictionaryRef gFastPrevSample = NULL;
+static CFAbsoluteTime gFastPrevStamp = 0;
+static uint64_t gFastCachedMHz = 0;
+
+uint64_t helium_real_cpu_frequency_mhz_fast(void)
+{
+    uint64_t result = 0;
+
+    os_unfair_lock_lock(&gFastLock);
+
+    if (ensureSymbols() && ensureFreqSubscription()) {
+        ensureFreqTables();
+
+        const CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+        if (now - gFastPrevStamp >= 0.20) {
+            CFDictionaryRef sample = pCreateSamples(gSubscription, gSubscribedChannels, NULL);
+            if (sample) {
+                if (gFastPrevSample) {
+                    CFDictionaryRef delta = pCreateSamplesDelta(gFastPrevSample, sample, NULL);
+                    if (delta) {
+                        ClusterClocks clocks = clocksFromDelta(delta, gPFreqs, gEFreqs);
+                        double chosen = clocks.pClusterMHz > 0 ? clocks.pClusterMHz
+                                                               : clocks.eClusterMHz;
+                        if (chosen > 0) {
+                            gFastCachedMHz = (uint64_t)(chosen + 0.5);
+                        }
+                        CFRelease(delta);
+                    }
+                    CFRelease(gFastPrevSample);
+                }
+                gFastPrevSample = (CFDictionaryRef)CFRetain(sample);
+                gFastPrevStamp = now;
+                CFRelease(sample);
+            }
+        }
+        result = gFastCachedMHz;
+    }
+
+    os_unfair_lock_unlock(&gFastLock);
+    return result;
+}
+
+uint64_t helium_real_cpu_peak_mhz(void)
+{
+    if (!ensureSymbols()) return 0;
+    ensureFreqTables();
+
+    uint64_t peak = 0;
+    for (NSNumber *n in gPFreqs) {
+        if (n.unsignedLongLongValue > peak) peak = n.unsignedLongLongValue;
+    }
+    if (peak == 0) {
+        for (NSNumber *n in gEFreqs) {
+            if (n.unsignedLongLongValue > peak) peak = n.unsignedLongLongValue;
+        }
+    }
+    return peak;
+}
+
+// ---------------------------------------------------------------------------
 // 0.17 self-check helpers
 // ---------------------------------------------------------------------------
 
@@ -691,9 +765,27 @@ static void appendOwnEntitlements(NSMutableString *out)
     }
 }
 
-// 0.31：`appendSharedFileCheck` 已删除 —— 它读的
-// /var/tmp/cpu_metrics.json 与 Caches 备用路径都随共享文件机制一起拿掉了，
-// 现在两个 App 各自读 IOReport，没有「文件里写的到底是探针值还是真实值」这个问题。
+// The shared file the frequency widget actually renders. Shows whether the value
+// on screen is the probe's or a real IOReport reading.
+static void appendSharedFileCheck(NSMutableString *out)
+{
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    for (NSString *path in @[ @"/var/tmp/cpu_metrics.json",
+                              @"/var/mobile/Library/Caches/cpu_metrics.json" ]) {
+        NSData *d = [NSData dataWithContentsOfFile:path];
+        if (!d) { [out appendFormat:@"     %@ : (missing)\n", path]; continue; }
+        NSDictionary *j = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+        if (![j isKindOfClass:[NSDictionary class]]) {
+            [out appendFormat:@"     %@ : (unparseable)\n", path];
+            continue;
+        }
+        NSTimeInterval ts = [j[@"ts"] doubleValue];
+        NSArray *pc = [j[@"per_core"] isKindOfClass:[NSArray class]] ? j[@"per_core"] : @[];
+        [out appendFormat:@"     %@ : freq_mhz=%@ freq_source=%@ writer=%@ age=%.1fs usage=%@ per_core=%lu\n",
+            path, j[@"freq_mhz"], j[@"freq_source"], j[@"writer"], now - ts,
+            j[@"usage"], (unsigned long)pc.count];
+    }
+}
 
 // Try subscribing to the WHOLE channel set (IOReportCopyAllChannels) — a
 // different code path from the per-group subscribe used elsewhere, and the one
@@ -724,67 +816,6 @@ static void appendWholeSetSubscribeCheck(NSMutableString *out)
         // CFRelease on one can take the HUD down (see header). This runs once.
     } @catch (NSException *e) {
         [out appendFormat:@"  Whole-set subscribe: failed (%@)\n", e.reason];
-    }
-}
-
-// Why the real reading still comes out 0 even though every group subscribes.
-// Walks the exact same chain helium_real_cpu_frequency_mhz() walks, printing
-// every step, so a 0 can be pinned to one of: samples NULL, delta NULL, no
-// channel named PCPU/ECPU, all-zero residency, or an empty weighted sum.
-static void appendRealFreqDetail(NSMutableString *out)
-{
-    @try {
-        [out appendString:@"\nReal-frequency chain (same path as the widget):\n"];
-        for (int i = 0; i < 3; i++) {
-            uint64_t m = helium_real_cpu_frequency_mhz();
-            [out appendFormat:@"   helium_real_cpu_frequency_mhz() #%d = %llu MHz\n", i + 1, m];
-        }
-
-        [out appendFormat:@"   subscription: tried=%d ok=%d active=%@\n",
-            gSubscriptionTried, gSubscriptionOK, gActiveGroupDescription ?: @"?"];
-        [out appendFormat:@"   P table(%lu)=%@\n", (unsigned long)gPFreqs.count, gPFreqs ?: @"nil"];
-        [out appendFormat:@"   E table(%lu)=%@\n", (unsigned long)gEFreqs.count, gEFreqs ?: @"nil"];
-
-        if (!gSubscription || !gSubscribedChannels) {
-            [out appendString:@"   (no subscription object — cannot sample)\n"];
-            return;
-        }
-
-        CFDictionaryRef s1 = pCreateSamples(gSubscription, gSubscribedChannels, NULL);
-        [out appendFormat:@"   s1=%s\n", s1 ? "ok" : "NULL"];
-        if (!s1) return;
-
-        struct timespec ts = { 0, 100 * 1000 * 1000 };
-        nanosleep(&ts, NULL);
-        CFDictionaryRef s2 = pCreateSamples(gSubscription, gSubscribedChannels, NULL);
-        [out appendFormat:@"   s2=%s\n", s2 ? "ok" : "NULL"];
-        if (!s2) { CFRelease(s1); return; }
-
-        CFDictionaryRef delta = pCreateSamplesDelta(s1, s2, NULL);
-        [out appendFormat:@"   delta=%s\n", delta ? "ok" : "NULL"];
-        if (delta) {
-            NSArray *chans = copyChannelsArrayFromSample(delta);
-            [out appendFormat:@"   delta channels=%lu\n", (unsigned long)chans.count];
-            for (id item in chans) {
-                if (![item isKindOfClass:[NSDictionary class]]) continue;
-                CFDictionaryRef metric = (__bridge CFDictionaryRef)item;
-                CFStringRef cfName = pChannelGetChannelName ? pChannelGetChannelName(metric) : NULL;
-                NSString *name = cfName ? (__bridge NSString *)cfName : @"?";
-                int states = pStateGetCount ? pStateGetCount(metric) : 0;
-                NSMutableString *res = [NSMutableString string];
-                for (int i = 0; i < states && i < 12; i++) {
-                    [res appendFormat:@"%lld,", (long long)pStateGetResidency(metric, i)];
-                }
-                [out appendFormat:@"      %@ states=%d residency=[%@]\n", name, states, res];
-            }
-            ClusterClocks c = clocksFromDelta(delta, gPFreqs, gEFreqs);
-            [out appendFormat:@"   computed: P=%.1f MHz  E=%.1f MHz\n", c.pClusterMHz, c.eClusterMHz];
-            CFRelease(delta);
-        }
-        CFRelease(s2);
-        CFRelease(s1);
-    } @catch (NSException *e) {
-        [out appendFormat:@"   real-freq chain failed: %@\n", e.reason];
     }
 }
 
@@ -831,7 +862,13 @@ NSString *helium_real_cpu_frequency_diagnosis(void)
     [out appendString:@"Self-check:\n"];
     [out appendFormat:@"  uid=%d gid=%d euid=%d\n", getuid(), getgid(), geteuid()];
     appendOwnEntitlements(out);
-    // 忙循环样本与共享文件读数都已删（0.31）：探针不再使用，共享文件机制也已拆除。
+    [out appendString:@"  Busy-loop probe samples (2 threads x ~62 ms per sample):\n"];
+    for (int i = 0; i < 5; i++) {
+        uint64_t m = helium_measure_cpu_frequency_mhz();
+        [out appendFormat:@"     sample %d: %llu MHz\n", i + 1, m];
+    }
+    [out appendString:@"  Shared file readings:\n"];
+    appendSharedFileCheck(out);
     appendWholeSetSubscribeCheck(out);
     [out appendString:@"\n"];
 
@@ -931,7 +968,6 @@ NSString *helium_real_cpu_frequency_diagnosis(void)
                         name, states, [stateNames componentsJoinedByString:@","]];
                 }
                 if (s) CFRelease(s);
-                appendRealFreqDetail(out);
             } else {
                 [out appendString:@"\nNo group could be subscribed to — the real-frequency path is unavailable.\n"];
             }
