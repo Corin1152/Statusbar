@@ -14,9 +14,7 @@
 #import <objc/runtime.h>
 #import <os/lock.h>
 #import "WidgetManager.h"
-#import "CPUFrequencyReal.h"   // helium_real_cpu_frequency_mhz —— IOReport 的真实频率
 #import <IOKit/IOKitLib.h>
-#import <unistd.h>            // getuid
 #import "../extensions/LunarDate.h"
 #import "../extensions/FontUtils.h"
 
@@ -974,7 +972,7 @@ static dispatch_queue_t cpuTempQueue(void)
     static dispatch_once_t once;
     static dispatch_queue_t queue = NULL;
     dispatch_once(&once, ^{
-        queue = dispatch_queue_create("com.corin.Statusbar.cputemp", DISPATCH_QUEUE_SERIAL);
+        queue = dispatch_queue_create("com.leemin.helium.cputemp", DISPATCH_QUEUE_SERIAL);
     });
     return queue;
 }
@@ -1053,16 +1051,18 @@ static NSString* formattedCPUTemp(BOOL useFahrenheit)
      formatter is otherwise a pure function, so the previous sample lives in a
      static — the same trick the network widget already uses for prevOutputBytes.
 
-   * The clock comes from IOReport (see CPUFrequencyReal.mm): CLPC 的 per-state
-     residency 加权平均。它只读计数器、不占性能核，但仍会阻塞约 100 ms
-     （两次采样之间的差分窗口），所以同样绝不能放在 HUD 的渲染路径上 ——
-     在独立队列上按固定节拍采样，formatter 只读缓存。
+   * The clock has to be *measured* with a busy loop (see CPUFrequencyProbe.mm),
+     which blocks for ~15-20 ms. That must never happen on the HUD's render path,
+     so it is sampled on its own queue at a fixed cadence and the formatter only
+     ever reads the cached value.
 
- Neither needs a new entitlement — host_processor_info 对沙箱 App 是开放的，
- 而 IOReport 走的是 `IOReportUserClient`（见 CPUFrequencyIOReport 的说明）。
+ Neither needs a new entitlement — host_processor_info and inline assembly are both
+ open to a jailed app. (The CPU temperature widget next door does need no-sandbox,
+ because IOReport does. The two are unrelated.)
  */
 
 #import <mach/mach.h>
+#import "CPUFrequencyProbe.h"
 
 // MARK: - CPU load
 
@@ -1237,56 +1237,84 @@ static NSString* formattedCPUUsage(NSInteger mode, BOOL showPercentage, NSIntege
 
 // MARK: - CPU frequency
 
-// 唯一一份频率缓存。由本文件的后台采样（`cpuFrequencyScheduleIfStale`）写入，
-// 渲染路径只读。
+// The formatter reads the in-process probe cache; the publisher writes that same
+// value to the shared file so SysProbe can read it. Keeping the file I/O out of the
+// render path matters — see the note on formattedCPUUsage.
 //
-// kHz；0 = 还没采到（界面显示「—」）。整数而非 double，是为了让渲染路径不加锁就能读：
-// arm64 上对齐的 64 位读写本身是原子的，而这个数只是状态栏上的一个提示值，
-// 即便真读到撕裂的旧值也无所谓。
+// kHz; 0 means "no usable reading yet". An integer rather than a double so the
+// sampling queue and the render path can share it without a lock — a naturally
+// aligned 64-bit load/store is atomic on arm64, and this is only ever a hint for a
+// status-bar readout, so a stale value on a torn read would not matter anyway.
 static uint64_t gCPUFrequencyKHz = 0;
 static CFAbsoluteTime gCPUFrequencyStamp = 0;
 static BOOL gCPUFrequencySampling = NO;
 
-/// 保护 `gCPUFrequencySampling` / `gCPUFrequencyStamp` 与下面那段 check-then-act。
-/// **不**保护 `gCPUFrequencyKHz` 的读 —— 见上面的说明。
+/// 上一次有部件**真的把这个数画到屏幕上**的时间。
+///
+/// 发布器（`CPUMetricsPublisher.mm`）用它决定要不要烧探针。理由：探针是 2 个性能核
+/// 各约 62 ms 的忙循环，而且线程 QoS 是 `QOS_CLASS_USER_INTERACTIVE` —— 它会**抢占
+/// 前台**。原来发布器每秒无条件 kick 一次，于是哪怕 HUD 上一个 CPU 频率部件都没有，
+/// 每 5 秒也照样来一次双性能核饱和；在 2 + 4 的 A11 上那就是肉眼可见的周期性掉帧。
+///
+/// 10 秒的窗口：比探针自己的 5 秒节流宽一倍，所以部件在屏幕上时它永远为真，不会
+/// 因为一次重绘的抖动就误判成「没人看」。
+static CFAbsoluteTime gCPUFrequencyWantedStamp = 0;
+
+/// Guards the `gCPUFrequencySampling` / `gCPUFrequencyStamp` pair and the
+/// check-then-act in `cpuFrequencyScheduleIfStale` below. **Not** the read of
+/// `gCPUFrequencyKHz` — see the paragraph above: an aligned 64-bit load is atomic on
+/// arm64 and it is only ever a readout hint.
 static os_unfair_lock gCPUFrequencyLock = OS_UNFAIR_LOCK_INIT;
 
-/// 频率采样间隔（秒）。
-///
-/// 0.31 起只有一个来源：IOReport 的真实 DVFS 加权频率
-/// （`helium_real_cpu_frequency_mhz()`）。它只读 CLPC 的 per-state residency
-/// 计数器，成本可忽略、也不占性能核 —— 1 秒一次没有代价。
-///
-/// 原来的忙循环探针（2 × 62 ms 的 user-interactive 忙循环，会抢前台，所以那时定在
-/// 5 秒）已经删掉：它量的是「能跑多快」的峰值，本来就不是这个部件要回答的问题。
-/// 采不到就留 0、界面显示「—」。
-#define CPU_FREQUENCY_SAMPLE_SECONDS 1.0
+// How long a measured clock stays usable.
+//
+// Two reasons this is seconds rather than "every redraw". The obvious one is cost:
+// the probe is a ~62 ms busy loop on each performance core (50 ms warm-up + 12 ms of
+// measured rounds, two threads — see CPUFrequencyProbe.mm), so running it per second
+// would spend about 12 % of the performance cluster forever.
+//
+// The other one is that the probe would be measuring its own effect. It raises the
+// clock on the cores it lands on in order to read a meaningful number, so sampling
+// it every second would keep the CPU boosted — the widget would be causing part of
+// the load it reports, and the battery cost of a status-bar readout would be real.
+// Between samples the readout repeats the last measurement, which is what every
+// other monitor does too.
+//
+// 5 s rather than the old 3 s: same reasoning, taken a step further. The probe is
+// also what made the device warm, and it runs at user-interactive QoS so it can
+// preempt the foreground UI — sampling it less often is a straight win on both.
+// At 5 s the two threads together come to ~2.5 % of the performance cluster.
+#define CPU_FREQUENCY_SAMPLE_SECONDS 5.0
 
 static dispatch_queue_t cpuFrequencyQueue(void)
 {
     static dispatch_once_t once;
     static dispatch_queue_t queue = NULL;
     dispatch_once(&once, ^{
-        queue = dispatch_queue_create("com.corin.Statusbar.cpufreq", DISPATCH_QUEUE_SERIAL);
+        queue = dispatch_queue_create("com.leemin.helium.cpufreq", DISPATCH_QUEUE_SERIAL);
     });
     return queue;
 }
 
-/// 缓存过期就发起一次采样，立即返回。
-///
-/// **HUD 侧唯一的频率采样点**（0.31 起）。原来发布器（`CPUMetricsPublisher`）也采
-/// 一遍、写共享文件给 SysProbe 读；现在两个 App 各自读 IOReport，那套机制已删除。
-///
-/// IOReport 那条路会阻塞约 100 ms（两次采样之间的差分窗口），所以绝不能放在渲染
-/// 路径上 —— 这也是这个函数只负责「调度」、真正调用在后台队列的原因。
+/// Kick off a measurement if the cached one has gone stale. Returns immediately.
 static void cpuFrequencyScheduleIfStale(void)
 {
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
 
-    // 只按时间节流，不看「有没有值」：采不到时若按「没值就重试」来判，
-    // 每一次重绘都会再发起一次采样。
+    // Throttled on time alone, success or failure: on a device where the probe
+    // cannot produce a plausible number, keying off "do we have a value" would burn
+    // a 62 ms busy loop on every single redraw.
+    //
+    // **The check-then-act has to be serialized as a whole.** This function has two
+    // callers and they are not on the same thread: `formattedCPUFrequency` on the
+    // render path (main thread) and `HeliumCPUFrequencyKick` on the publisher queue.
+    // Unsynced, both could pass the `gCPUFrequencySampling` check at once and each
+    // `dispatch_async` its own block — the serial queue would dutifully run the probe
+    // **twice**, burning 62 ms on two performance cores for nothing and letting the
+    // two probes steal each other's cores, which drags both readings down.
     os_unfair_lock_lock(&gCPUFrequencyLock);
-    BOOL stale = (!gCPUFrequencySampling && (now - gCPUFrequencyStamp) >= CPU_FREQUENCY_SAMPLE_SECONDS);
+    BOOL stale = (!gCPUFrequencySampling
+                  && (now - gCPUFrequencyStamp) >= CPU_FREQUENCY_SAMPLE_SECONDS);
     if (stale) {
         gCPUFrequencySampling = YES;
     }
@@ -1297,10 +1325,9 @@ static void cpuFrequencyScheduleIfStale(void)
     }
 
     dispatch_async(cpuFrequencyQueue(), ^{
-        uint64_t megahertz = helium_real_cpu_frequency_mhz();
-
+        uint64_t megahertz = helium_measure_cpu_frequency_mhz();
         os_unfair_lock_lock(&gCPUFrequencyLock);
-        gCPUFrequencyKHz = megahertz * 1000ull;   // 0 = 没采到，下一拍再试
+        gCPUFrequencyKHz = megahertz * 1000ull;   // 0 on failure; retried in 5 s
         gCPUFrequencyStamp = CFAbsoluteTimeGetCurrent();
         gCPUFrequencySampling = NO;
         os_unfair_lock_unlock(&gCPUFrequencyLock);
@@ -1309,13 +1336,19 @@ static void cpuFrequencyScheduleIfStale(void)
 
 /// `unit`: 0 = GHz, 1 = MHz.
 ///
-/// 读进程内缓存，不碰文件也不阻塞：IOReport 的采样在后台队列上跑（见上），
-/// 这里只把上一次的结果格式化出来。
+/// **Reads the in-process probe cache, not the shared file.** Same reasoning as
+/// `formattedCPUUsage`: this runs on the render path, and the value is identical to
+/// what the publisher writes (`HeliumCPUFrequencyKHz()` returns the very same
+/// `gCPUFrequencyKHz` the file carries), so there is no reason to pay for file I/O
+/// here. The publisher still writes the file so SysProbe can read it.
 ///
-/// 采不到时返回「--」—— **刻意不回落成标称主频**，那是个常数，摆在「当前频率」的
-/// 位置上会让人以为读数有效。
+/// The first redraw after launch shows "--" and the next one a number (the probe is
+/// asynchronous), which is the same behaviour as before.
 static NSString* formattedCPUFrequency(NSInteger unit)
 {
+    // 有部件在问，就记一笔「有人在看」—— 发布器据此决定要不要继续烧探针。
+    gCPUFrequencyWantedStamp = CFAbsoluteTimeGetCurrent();
+
     // Never block the render path: ask for a fresh sample if the cache is stale,
     // then report whatever the last one produced.
     cpuFrequencyScheduleIfStale();
@@ -1331,18 +1364,65 @@ static NSString* formattedCPUFrequency(NSInteger unit)
     return [NSString stringWithFormat:@"%.2f GHz", (double)khz / 1000000.0];
 }
 
-// MARK: - Shared-metrics accessors（0.31 已删除）
+// MARK: - Shared-metrics accessors
 
 /*
- 这里原来导出三个 C 链接符号 —— `HeliumCPUUsageFraction` /
- `HeliumCPUPerCoreFractions` / `HeliumCPUFrequencyKHz` —— 供同进程的
- `CPUMetricsPublisher.mm` 把 CPU 占用与频率写进共享文件给 SysProbe 读。
+ The CPU readings above are file-scope statics, and CPUMetricsPublisher.mm lives in
+ the same binary — so a plain C-linkage accessor is all the publisher needs. They
+ deliberately return the *same* cached values the widgets render, so a second app
+ reading the published file shows exactly what this HUD shows.
 
- 0.31 起两个 App **各自读 IOReport**，共享文件那套机制整段删除、发布器也不存在了，
- 于是这三个 accessor 没有任何调用者，一并删掉。
-
- （`cpuBusyFractions` 保留 —— 它还被 `formattedCPUUsage` 用着。）
+ `extern "C"` is required: this file is Objective-C++, and without it the symbols
+ would be name-mangled and CPUMetricsPublisher.mm would fail to link.
 */
+
+extern "C" double HeliumCPUUsageFraction(void)
+{
+    double *fractions = NULL;
+    natural_t count = 0;
+    if (!cpuBusyFractions(&fractions, &count) || fractions == NULL || count == 0) {
+        return 0.0;
+    }
+    double sum = 0.0;
+    for (natural_t i = 0; i < count; i++) {
+        sum += fractions[i];
+    }
+    return sum / (double)count;
+}
+
+extern "C" NSArray<NSNumber *> *HeliumCPUPerCoreFractions(void)
+{
+    double *fractions = NULL;
+    natural_t count = 0;
+    if (!cpuBusyFractions(&fractions, &count) || fractions == NULL || count == 0) {
+        return @[];
+    }
+    NSMutableArray<NSNumber *> *result = [NSMutableArray arrayWithCapacity:(NSUInteger)count];
+    for (natural_t i = 0; i < count; i++) {
+        [result addObject:@(fractions[i])];
+    }
+    return result;
+}
+
+extern "C" uint64_t HeliumCPUFrequencyKHz(void)
+{
+    return gCPUFrequencyKHz;
+}
+
+extern "C" void HeliumCPUFrequencyKick(void)
+{
+    cpuFrequencyScheduleIfStale();
+}
+
+/// 最近 10 秒内有没有部件真的画过 CPU 频率。
+///
+/// 发布器用它给探针做门控：没人显示这个数的时候就不测了。SysProbe 那边不受影响 ——
+/// 它读共享文件，读不到（或读到 `freq_mhz: 0`）会回落到它自己的采样，本来就有这条
+/// 降级路径（见 SysProbe 的 `CPUSharedMetrics.swift`）。
+extern "C" BOOL HeliumCPUFrequencyWidgetInUse(void)
+{
+    return (CFAbsoluteTimeGetCurrent() - gCPUFrequencyWantedStamp) < 10.0;
+}
 
 // MARK: - Cellular signal (RSRP)
 
@@ -1390,7 +1470,7 @@ static dispatch_queue_t cellularSignalQueue(void)
     static dispatch_once_t once;
     static dispatch_queue_t queue = NULL;
     dispatch_once(&once, ^{
-        queue = dispatch_queue_create("com.corin.Statusbar.cellularsignal", DISPATCH_QUEUE_SERIAL);
+        queue = dispatch_queue_create("com.leemin.helium.cellularsignal", DISPATCH_QUEUE_SERIAL);
     });
     return queue;
 }
@@ -1426,7 +1506,7 @@ static dispatch_queue_t wifiSignalQueue(void)
     static dispatch_once_t once;
     static dispatch_queue_t queue = NULL;
     dispatch_once(&once, ^{
-        queue = dispatch_queue_create("com.corin.Statusbar.wifisignal", DISPATCH_QUEUE_SERIAL);
+        queue = dispatch_queue_create("com.leemin.helium.wifisignal", DISPATCH_QUEUE_SERIAL);
     });
     return queue;
 }
