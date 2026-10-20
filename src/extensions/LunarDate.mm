@@ -23,13 +23,28 @@
  @return 返回干支年 农历月份 农历初几
  */
 + (NSString*)getChineseCalendarWithDate:(NSDate *)date format:(NSString *)format{
+    if (format.length == 0) return format;
+
     NSCalendar *chineseCalendar = [[self class] chineseCalendar];
     unsigned unitFlags = NSCalendarUnitYear | NSCalendarUnitMonth |  NSCalendarUnitDay;
     NSDateComponents *localeComp = [chineseCalendar components:unitFlags fromDate:date];
-    
-    NSString *y_str = [ChineseYears objectAtIndex:localeComp.year-1];
-    NSString *m_str = [ChineseMonths objectAtIndex:localeComp.month-1];
-    NSString *d_str = [ChineseDays objectAtIndex:localeComp.day-1];
+
+    // 三条 `objectAtIndex:` 原来都直接用 `comp-1` 当索引。0.35 的格式简码表会把
+    // CNYY/CNMM/CNDD 摆到用户面前，任何一次越界（农历年不是 1...60 的循环值、
+    // 闰月、`components:` 返回 0）都会抛 NSRangeException 把 HUD 打掉。
+    // 越界时退化成空串：格式里少一段，总比进程没了强。
+    NSString *y_str = @"";
+    NSString *m_str = @"";
+    NSString *d_str = @"";
+
+    const NSInteger yi = localeComp.year - 1;
+    const NSInteger mi = localeComp.month - 1;
+    const NSInteger di = localeComp.day - 1;
+
+    if (yi >= 0 && yi < (NSInteger)ChineseYears.count) y_str = ChineseYears[yi];
+    if (mi >= 0 && mi < (NSInteger)ChineseMonths.count) m_str = ChineseMonths[mi];
+    if (di >= 0 && di < (NSInteger)ChineseDays.count) d_str = ChineseDays[di];
+
     format = [format stringByReplacingOccurrencesOfString:@"CNYY" withString:y_str];
     format = [format stringByReplacingOccurrencesOfString:@"CNMM" withString:m_str];
     format = [format stringByReplacingOccurrencesOfString:@"CNDD" withString:d_str];

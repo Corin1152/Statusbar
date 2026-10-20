@@ -209,3 +209,37 @@
 
 /* WeatherUtils.mm */
 "error" = "出错啦";
+
+/* Date Widget (0.35) */
+
+"Preview" = "预览";
+"Weekday Language" = "星期语言";
+"Supported Format Codes" = "支持的格式简码";
+"Follow System" = "跟随系统";
+"Simplified Chinese" = "简体中文";
+"Traditional Chinese" = "繁體中文";
+"English" = "English";
+"Japanese" = "日本語";
+"Four-digit year" = "四位年份";
+"Two-digit year" = "两位年份";
+"Full month name" = "月份全称";
+"Short month name" = "月份简称";
+"Two-digit month" = "两位月份";
+"Month" = "月份";
+"Two-digit day" = "两位日期";
+"Day" = "日期";
+"Full weekday name" = "星期全称";
+"Short weekday name" = "星期简称";
+"Short weekday name (same as EEE)" = "星期简称（同 EEE）";
+"24-hour, two digits" = "24 小时制，两位";
+"24-hour" = "24 小时制";
+"12-hour, two digits" = "12 小时制，两位";
+"12-hour" = "12 小时制";
+"AM / PM marker" = "上午 / 下午标记";
+"Two-digit minute" = "两位分钟";
+"Minute" = "分钟";
+"Two-digit second" = "两位秒";
+"Second" = "秒";
+"Lunar year (stems and branches)" = "农历干支年";
+"Lunar month" = "农历月";
+"Lunar day" = "农历日";

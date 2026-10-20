@@ -24,17 +24,6 @@ extern "C" {
 /// so the caller can fall back to the busy-loop probe.
 uint64_t helium_real_cpu_frequency_mhz(void);
 
-/// Same reading, but **non-blocking**: it diffs against the previous sample instead
-/// of sleeping 100 ms between two of them, so it is safe to call from a control loop
-/// (see CPUFrequencyGovernor.mm). Returns the cached value when called more often
-/// than the residency counters can produce a meaningful delta (~200 ms), and 0 when
-/// the IOReport path is unavailable.
-uint64_t helium_real_cpu_frequency_mhz_fast(void);
-
-/// Highest gear in the performance cluster's DVFS table, in MHz — the value the
-/// governor treats as "top". 0 when the table could not be read.
-uint64_t helium_real_cpu_peak_mhz(void);
-
 /// Human-readable report of what IOReport and the device tree actually expose on
 /// this machine: every group/subgroup/channel that was enumerable, the state names
 /// of the CPU Stats channels, and the DVFS tables that were found. Written to a

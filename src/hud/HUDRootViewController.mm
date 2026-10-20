@@ -7,7 +7,6 @@
 
 #import "../widgets/WidgetManager.h"
 #import "../widgets/CPUMetricsPublisher.h"
-#import "../widgets/CPUFrequencyGovernor.h"
 #import "../extensions/UsefulFunctions.h"
 #import "../extensions/FontUtils.h"
 #import "../extensions/EZTimer.h"
@@ -120,21 +119,12 @@ static void SpringBoardLockStatusChanged
             [rootViewController.view setHidden:NO];
             [rootViewController resumeLoopTimer];
 
-            // 0.34 事件驱动预热：解锁是用户马上要开始交互的时刻，在这里打一段
-            // 短脉冲，比常驻保频便宜得多 —— 热预算落在真正要用的时候，而不是
-            // 全程空转。chirp 在 governor 关闭时是空操作。
-            helium_governor_suspend(NO);
-            helium_governor_chirp(700);
-
             helium_dbg(@"unlock: view unhidden + timers resumed");
         }
         else
         {
             [rootViewController pauseLoopTimer];
             [rootViewController.view setHidden:YES];
-
-            // 锁屏后没有任何东西能变流畅，继续保频只是纯耗电。
-            helium_governor_suspend(YES);
         }
     }
 }
@@ -264,11 +254,6 @@ static CFAbsoluteTime gLastReloadStamp = 0;
 - (void) reloadUserDefaults
 {
     [self loadUserDefaults: YES];
-
-    // 0.34 CPU 保频（测试）。设置写在同一个 plist 里（键 cpuGovernorMode），
-    // App 改完发 NOTIFY_RELOAD_HUD，HUD 在这里重新应用。apply 是幂等的，
-    // 重复调用不会重复建线程。
-    helium_governor_apply((int)getIntFromDictKey(_userDefaults, @"cpuGovernorMode", 0));
 
     if ([self debugBorder]) {
         _contentView.layer.borderWidth = 1.0;
@@ -402,7 +387,10 @@ static CFAbsoluteTime gLastReloadStamp = 0;
 {
     [self loadUserDefaults:NO];
     NSString *locale = [_userDefaults objectForKey: @"dateLocale"];
-    return locale ? locale : @"en_US";
+    // 没设过就「跟随系统」—— 0.35 之前这里回退到 en_US，中文系统的用户即使
+    // 系统语言是中文，星期也只会显示成 Tue。空值交给 formattedDate 解析成
+    // [NSLocale currentLocale]。
+    return locale.length ? locale : @"system";
 }
 
 - (NSArray*) widgetProperties

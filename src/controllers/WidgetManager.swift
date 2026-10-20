@@ -8,15 +8,60 @@
 import Foundation
 import SwiftUI
 
+// MARK: - Date Locale（0.35）
+
+/// 日期部件「星期语言」的选项。
+///
+/// 星期与月份的名字由 **locale** 决定，不是由格式串决定 —— `E` 在 `en_US` 下是
+/// `Tue`，在 `zh_CN` 下才是 `周二`。0.35 之前 `dateLocale` 只是一个隐藏的 plist
+/// 键，界面上没有入口，所以永远停在 `en_US`，这就是「星期只能显示英文」的原因。
+enum DateLocaleOption: String, CaseIterable, Identifiable {
+    case system = "system"
+    case simplifiedChinese = "zh_CN"
+    case traditionalChinese = "zh_TW"
+    case english = "en_US"
+    case japanese = "ja_JP"
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .system:
+            return NSLocalizedString("Follow System", comment: "")
+        case .simplifiedChinese:
+            return NSLocalizedString("Simplified Chinese", comment: "")
+        case .traditionalChinese:
+            return NSLocalizedString("Traditional Chinese", comment: "")
+        case .english:
+            return NSLocalizedString("English", comment: "")
+        case .japanese:
+            return NSLocalizedString("Japanese", comment: "")
+        }
+    }
+
+    /// 与 HUD 侧 `resolvedDateLocale()` 使用同一套规则：空值与 `system` 都落到
+    /// `Locale.current`，其余按标识构造。
+    static func resolved(_ raw: String?) -> Locale {
+        guard let raw = raw, !raw.isEmpty, raw != DateLocaleOption.system.rawValue else {
+            return Locale.current
+        }
+        return Locale(identifier: raw)
+    }
+}
+
+/// 日期格式简码表的一行：简码、含义、以及用当前日期渲染出的示例。
+struct DateFormatToken: Identifiable {
+    let token: String
+    let desc: String
+    var id: String { token }
+}
+
 enum WidgetModule: Int, CaseIterable {
     case dateWidget = 1
     case timeWidget = 5
 
     case network = 2
 
-    case battery = 4
-    case currentCapacity = 7
-    case chargeSymbol = 8
     case temperature = 3
 
     case textWidget = 6
@@ -476,16 +521,10 @@ class WidgetDetails {
             return (NSLocalizedString("Network", comment: ""), "▲ 0 KB/s")
         case .temperature:
             return (NSLocalizedString("Device Temperature", comment: ""), "29.34ºC")
-        case .battery:
-            return (NSLocalizedString("Battery Details", comment: ""), "25 W")
         case .timeWidget:
             return (NSLocalizedString("Time", comment: ""), "14:57:05")
         case .textWidget:
             return (NSLocalizedString("Text Label", comment: ""), NSLocalizedString("Example", comment: ""))
-        case .currentCapacity:
-            return (NSLocalizedString("Battery Capacity", comment: ""), "50%")
-        case .chargeSymbol:
-            return (NSLocalizedString("Charging Symbol", comment: ""), "⚡️")
         case .cpuTemperature:
             return (NSLocalizedString("CPU Temperature", comment: ""), "42.50ºC")
         case .cpuUsage:

@@ -208,3 +208,37 @@
 
 /* WeatherUtils.mm */
 "error" = "error";
+
+/* Date Widget (0.35) */
+
+"Preview" = "Preview";
+"Weekday Language" = "Weekday Language";
+"Supported Format Codes" = "Supported Format Codes";
+"Follow System" = "Follow System";
+"Simplified Chinese" = "Simplified Chinese";
+"Traditional Chinese" = "Traditional Chinese";
+"English" = "English";
+"Japanese" = "Japanese";
+"Four-digit year" = "Four-digit year";
+"Two-digit year" = "Two-digit year";
+"Full month name" = "Full month name";
+"Short month name" = "Short month name";
+"Two-digit month" = "Two-digit month";
+"Month" = "Month";
+"Two-digit day" = "Two-digit day";
+"Day" = "Day";
+"Full weekday name" = "Full weekday name";
+"Short weekday name" = "Short weekday name";
+"Short weekday name (same as EEE)" = "Short weekday name (same as EEE)";
+"24-hour, two digits" = "24-hour, two digits";
+"24-hour" = "24-hour";
+"12-hour, two digits" = "12-hour, two digits";
+"12-hour" = "12-hour";
+"AM / PM marker" = "AM / PM marker";
+"Two-digit minute" = "Two-digit minute";
+"Minute" = "Minute";
+"Two-digit second" = "Two-digit second";
+"Second" = "Second";
+"Lunar year (stems and branches)" = "Lunar year (stems and branches)";
+"Lunar month" = "Lunar month";
+"Lunar day" = "Lunar day";

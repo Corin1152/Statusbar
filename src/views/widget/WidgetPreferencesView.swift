@@ -22,6 +22,12 @@ struct WidgetPreferencesView: View {
     @State var modified: Bool = false
     @State private var isPresented = false
 
+    /// 日期部件的「星期语言」。写全局键 `dateLocale`，与 HUD 共用一个值。
+    @State private var dateLocaleRaw: String = DateLocaleOption.system.rawValue
+
+    /// 格式简码表的展开状态。默认收起 —— 展开后是二十多行，会把手动输入框顶出屏幕。
+    @State private var showFormatTokens: Bool = false
+
     /// 蜂窝信号探针的状态（"pending" / "ok" / "unavailable"），见 SwiftObjCPPBridger.h。
     @State private var cellularStatus: String = ""
 
@@ -109,6 +115,45 @@ struct WidgetPreferencesView: View {
     
     let dateFormatter = DateFormatter()
     let currentDate = Date()
+
+    /// 日期格式简码表。
+    ///
+    /// 只列真正有用的子集：`y`/`M`/`d`/`E`/`H`/`h`/`m`/`s`/`a` 已经覆盖日常所有写法；
+    /// 末尾三条 `CN*` 是 Helium 自己加的农历占位符（见 LunarDate.mm），Foundation
+    /// 不认识它们，由 `getChineseCalendarWithDate:format:` 在格式化前替换成中文。
+    ///
+    /// 示例值全部由当前日期实时渲染 —— 表里看到的，就是切回桌面后部件上显示的。
+    let dateFormatTokens: [DateFormatToken] = [
+        .init(token: "yyyy", desc: NSLocalizedString("Four-digit year", comment: "")),
+        .init(token: "yy", desc: NSLocalizedString("Two-digit year", comment: "")),
+
+        .init(token: "MMMM", desc: NSLocalizedString("Full month name", comment: "")),
+        .init(token: "MMM", desc: NSLocalizedString("Short month name", comment: "")),
+        .init(token: "MM", desc: NSLocalizedString("Two-digit month", comment: "")),
+        .init(token: "M", desc: NSLocalizedString("Month", comment: "")),
+
+        .init(token: "dd", desc: NSLocalizedString("Two-digit day", comment: "")),
+        .init(token: "d", desc: NSLocalizedString("Day", comment: "")),
+
+        .init(token: "EEEE", desc: NSLocalizedString("Full weekday name", comment: "")),
+        .init(token: "EEE", desc: NSLocalizedString("Short weekday name", comment: "")),
+        .init(token: "E", desc: NSLocalizedString("Short weekday name (same as EEE)", comment: "")),
+
+        .init(token: "HH", desc: NSLocalizedString("24-hour, two digits", comment: "")),
+        .init(token: "H", desc: NSLocalizedString("24-hour", comment: "")),
+        .init(token: "hh", desc: NSLocalizedString("12-hour, two digits", comment: "")),
+        .init(token: "h", desc: NSLocalizedString("12-hour", comment: "")),
+        .init(token: "a", desc: NSLocalizedString("AM / PM marker", comment: "")),
+
+        .init(token: "mm", desc: NSLocalizedString("Two-digit minute", comment: "")),
+        .init(token: "m", desc: NSLocalizedString("Minute", comment: "")),
+        .init(token: "ss", desc: NSLocalizedString("Two-digit second", comment: "")),
+        .init(token: "s", desc: NSLocalizedString("Second", comment: "")),
+
+        .init(token: "CNYY", desc: NSLocalizedString("Lunar year (stems and branches)", comment: "")),
+        .init(token: "CNMM", desc: NSLocalizedString("Lunar month", comment: "")),
+        .init(token: "CNDD", desc: NSLocalizedString("Lunar day", comment: "")),
+    ]
     
     var body: some View {
         VStack {
@@ -117,22 +162,82 @@ struct WidgetPreferencesView: View {
             
             switch (widgetID.module) {
             case .dateWidget:
-                // MARK: Date Format Textbox
-                HStack {
-                    Text(NSLocalizedString("Date Format", comment:""))
-                        .foregroundColor(.primary)
-                        .bold()
-                    Spacer()
-                    TextField(NSLocalizedString("E MMM dd", comment:""), text: $text)
-                        .frame(maxWidth: 120)
-                        .multilineTextAlignment(.trailing)
-                        .onAppear {
-                            if let format = widgetID.config["dateFormat"] as? String {
-                                text = format
-                            } else {
-                                text = NSLocalizedString("E MMM dd", comment:"")
+                // MARK: Date Format / Locale
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack {
+                        Text(NSLocalizedString("Date Format", comment:""))
+                            .foregroundColor(.primary)
+                            .bold()
+                        Spacer()
+                        TextField(NSLocalizedString("E MMM dd", comment:""), text: $text)
+                            .frame(maxWidth: 130)
+                            .multilineTextAlignment(.trailing)
+                            .autocorrectionDisabled(true)
+                            .onAppear {
+                                if let format = widgetID.config["dateFormat"] as? String {
+                                    text = format
+                                } else {
+                                    text = NSLocalizedString("E MMM dd", comment:"")
+                                }
+                            }
+                    }
+
+                    // 实时预览：格式串是手写的，改一个字母就得能立刻看到结果，
+                    // 否则用户只能回桌面确认。
+                    HStack {
+                        Text(NSLocalizedString("Preview", comment:""))
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Spacer()
+                        Text(getFormattedDate(text.isEmpty ? NSLocalizedString("E MMM dd", comment:"") : text))
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundColor(.primary)
+                            .lineLimit(1)
+                    }
+
+                    // MARK: Weekday Language
+                    HStack {
+                        Text(NSLocalizedString("Weekday Language", comment:""))
+                            .foregroundColor(.primary)
+                            .bold()
+                        Spacer()
+                        Picker(selection: $dateLocaleRaw) {
+                            ForEach(DateLocaleOption.allCases) { option in
+                                Text(option.displayName).tag(option.rawValue)
+                            }
+                        } label: {}
+                        .pickerStyle(.menu)
+                    }
+
+                    // MARK: Format Codes
+                    DisclosureGroup(isExpanded: $showFormatTokens) {
+                        VStack(alignment: .leading, spacing: 7) {
+                            ForEach(dateFormatTokens) { item in
+                                HStack(alignment: .firstTextBaseline, spacing: 10) {
+                                    Text(item.token)
+                                        .font(.system(.caption, design: .monospaced))
+                                        .foregroundColor(.blue)
+                                        .frame(width: 54, alignment: .leading)
+                                    Text(item.desc)
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                    Spacer()
+                                    Text(getFormattedDate(item.token))
+                                        .font(.system(.caption, design: .monospaced))
+                                        .foregroundColor(.primary)
+                                }
                             }
                         }
+                        .padding(.top, 6)
+                    } label: {
+                        Text(NSLocalizedString("Supported Format Codes", comment:""))
+                            .font(.subheadline)
+                            .foregroundColor(.primary)
+                    }
+                }
+                .onAppear {
+                    dateLocaleRaw = UserDefaults.standard.string(forKey: "dateLocale", forPath: USER_DEFAULTS_PATH)
+                        ?? DateLocaleOption.system.rawValue
                 }
             case .network:
                 // MARK: Network Type Choice
@@ -357,26 +462,6 @@ struct WidgetPreferencesView: View {
                     cellularStatus = HeliumCellularSignalStatusBridger() ?? ""
                     signalSource = HeliumSignalSourceBridger() ?? "pending"
                 }
-            case .battery:
-                // MARK: Battery Value Type
-                HStack {
-                    Text(NSLocalizedString("Battery Option", comment:"")).foregroundColor(.primary).bold()
-                    Spacer()
-                    Picker(selection: $intSelection) {
-                        Text(NSLocalizedString("Watts", comment:"")).tag(0)
-                        Text(NSLocalizedString("Charging Current", comment:"")).tag(1)
-                        Text(NSLocalizedString("Amperage", comment:"")).tag(2)
-                        Text(NSLocalizedString("Charge Cycles", comment:"")).tag(3)
-                    } label: {}
-                    .pickerStyle(.menu)
-                    .onAppear {
-                        if let batteryType = widgetID.config["batteryValueType"] as? Int {
-                            intSelection = batteryType
-                        } else {
-                            intSelection = 0
-                        }
-                    }
-                }
             case .timeWidget:
                 // MARK: Time Format Selector
                 HStack {
@@ -411,30 +496,6 @@ struct WidgetPreferencesView: View {
                             }
                         }
                 }
-            case .currentCapacity:
-                // MARK: Current Capacity Choice
-                HStack {
-                    Toggle(isOn: $boolSelection) {
-                        Text(NSLocalizedString("Show Percent (%) Symbol", comment:""))
-                            .foregroundColor(.primary)
-                            .bold()
-                    }
-                    .onAppear {
-                        boolSelection = widgetID.config["showPercentage"] as? Bool ?? true
-                    }
-                }
-            case .chargeSymbol:
-                // MARK: Charge Symbol Fill Option
-                HStack {
-                    Toggle(isOn: $boolSelection) {
-                        Text(NSLocalizedString("Fill Symbol", comment:""))
-                            .foregroundColor(.primary)
-                            .bold()
-                    }
-                    .onAppear {
-                        boolSelection = widgetID.config["filled"] as? Bool ?? true
-                    }
-                }
             // default:
             //     Text(NSLocalizedString("No Configurable Aspects", comment:""))
             }
@@ -463,6 +524,9 @@ struct WidgetPreferencesView: View {
         .onChange(of: text) { _ in
             modified = true
         }
+        .onChange(of: dateLocaleRaw) { _ in
+            modified = true
+        }
                 .onChange(of: intSelection) { _ in
             modified = true
         }
@@ -478,10 +542,10 @@ struct WidgetPreferencesView: View {
     }
     
     func getFormattedDate(_ format: String) -> String {
-        let locale = UserDefaults.standard.string(forKey: "dateLocale", forPath: USER_DEFAULTS_PATH) ?? "en_US"
-        dateFormatter.locale = Locale(identifier: locale)
-        dateFormatter.dateFormat = format
-        // dateFormatter.locale = Locale(identifier: NSLocalizedString("en_US", comment:""))
+        let raw = UserDefaults.standard.string(forKey: "dateLocale", forPath: USER_DEFAULTS_PATH)
+        dateFormatter.locale = DateLocaleOption.resolved(raw)
+        // 农历占位符要先替换掉，否则 Foundation 会把 CNYY 当成三个普通字符输出。
+        dateFormatter.dateFormat = LunarDate.getChineseCalendar(with: currentDate, format: format)
         return dateFormatter.string(from: currentDate)
     }
     
@@ -497,6 +561,10 @@ struct WidgetPreferencesView: View {
             } else {
                 widgetStruct.config["dateFormat"] = text
             }
+            // 星期语言是**全局**设置：HUD 从 plist 顶层键 `dateLocale` 读它，而不是
+            // 从单个部件的 config 里读。所有日期部件共用同一个语言，这正是想要的
+            // 语义 —— 没道理让同一块 HUD 上的两个日期显示不同语言的星期。
+            UserDefaults.standard.setValue(dateLocaleRaw, forKey: "dateLocale", forPath: USER_DEFAULTS_PATH)
         case .textWidget:
             // MARK: Custom Text Handling
             if text == "" {
@@ -531,19 +599,9 @@ struct WidgetPreferencesView: View {
             widgetStruct.config["signalSlot"] = intSelection
             widgetStruct.config["showUnit"] = boolSelection
             widgetStruct.config["followNetwork"] = followNetwork
-        case .battery:
-            // MARK: Battery Value Type Handling
-            widgetStruct.config["batteryValueType"] = intSelection
         case .timeWidget:
             // MARK: Time Format Handling
             widgetStruct.config["dateFormat"] = timeFormats[intSelection]
-        // MARK: Changing Boolean
-        case .currentCapacity:
-            // MARK: Current Capacity Handling
-            widgetStruct.config["showPercentage"] = boolSelection
-        case .chargeSymbol:
-            // MARK: Charge Symbol Fill Handling
-            widgetStruct.config["filled"] = boolSelection
         // default:
         //     return;
         }

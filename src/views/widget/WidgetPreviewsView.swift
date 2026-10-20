@@ -58,8 +58,9 @@ struct WidgetPreviewsView: View {
             let dateFormatter = DateFormatter()
             let newDateFormat = LunarDate.getChineseCalendar(with: Date(), format: dateFormat)
             dateFormatter.dateFormat = newDateFormat
-            let locale = UserDefaults.standard.string(forKey: "dateLocale", forPath: USER_DEFAULTS_PATH) ?? "en_US"
-            dateFormatter.locale = Locale(identifier: locale)
+            let locale = DateLocaleOption.resolved(
+                UserDefaults.standard.string(forKey: "dateLocale", forPath: USER_DEFAULTS_PATH))
+            dateFormatter.locale = locale
             text = dateFormatter.string(from: Date())
             // SAFEGUARD
             if (text == "") {
@@ -81,27 +82,9 @@ struct WidgetPreviewsView: View {
             text = (widget.config["freqUnit"] as? Int ?? 0) == 1 ? "2390 MHz" : "2.39 GHz"
         case .cellularSignal:
             text = (widget.config["showUnit"] as? Bool ?? true) ? "-95 dBm" : "-95"
-        case .battery:
-            let batteryValue: Int = widget.config["batteryValueType"] as? Int ?? 0
-            switch (batteryValue) {
-            case 0:
-                text = "0 W"
-            case 1:
-                text = "0 mA"
-            case 2:
-                text = "0 mA"
-            case 3:
-                text = "25"
-            default:
-                text = "???"
-            }
         case .textWidget:
             text = widget.config["text"] as? String ?? NSLocalizedString("Unknown", comment:"")
             break;
-        case .currentCapacity:
-            text = "50\(widget.config["showPercentage"] as? Bool ?? true ? "%" : "")"
-        case .chargeSymbol:
-            image = widget.config["filled"] as? Bool ?? true ? Image(systemName: "bolt.fill") : Image(systemName: "bolt")
         }
         widget.modified = false
     }

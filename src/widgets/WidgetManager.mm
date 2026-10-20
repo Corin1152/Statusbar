@@ -37,7 +37,6 @@
 
 #pragma mark - Widget-specific Variables
 // MARK: 0 - Date Widget
-static NSDateFormatter *formatter = nil;
 
 // MARK: Net Speed Widget
 static uint8_t DATAUNIT = 0;
@@ -54,14 +53,57 @@ static NSAttributedString *attributedUploadPrefix2 = nil;
 static NSAttributedString *attributedDownloadPrefix2 = nil;
 
 #pragma mark - Date Widget
-static NSString* formattedDate(NSString *dateFormat, NSString *dateLocale)
+
+/// 「跟随系统」的哨兵值。App 侧写这个字符串，HUD 侧解析成 `[NSLocale currentLocale]`。
+/// 中文系统自然得到中文星期，英文系统仍是英文 —— 这就是「跟随系统」该有的行为。
+static NSString *const HeliumDateLocaleSystem = @"system";
+
+/// 把 plist 里的标识解析成实际使用的 locale。
+///
+/// 空值与 `system` 都落到系统当前 locale。用 `currentLocale` 而不是
+/// `preferredLanguages`：前者跟随「区域」设置，后者跟随「语言」列表，而星期、月份
+/// 的名字由区域决定 —— 系统语言是英文但区域是中国时，用户要的通常是中文星期。
+static NSLocale *resolvedDateLocale(NSString *identifier)
 {
+    if (identifier.length == 0 || [identifier isEqualToString:HeliumDateLocaleSystem]) {
+        return [NSLocale currentLocale];
+    }
+    return [[NSLocale alloc] initWithLocaleIdentifier:identifier];
+}
+
+/// 取（并缓存）某个 locale 对应的 formatter。
+///
+/// 0.35 之前这里只有一个全局 formatter，而且 `locale` 只在它被创建的那一次设置 ——
+/// 用户把「星期语言」从 English 改成中文后，拿到的还是旧 formatter，星期照旧是英文。
+/// 现在按 locale 分桶：键的取值空间只有界面上那几个选项，字典不会无限增长。
+static NSDateFormatter *dateFormatterForLocale(NSLocale *locale)
+{
+    static NSMutableDictionary<NSString *, NSDateFormatter *> *cache = nil;
+    static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
+
+    NSString *key = locale.localeIdentifier ?: @"en_US";
+
+    os_unfair_lock_lock(&lock);
+    if (!cache) cache = [NSMutableDictionary dictionary];
+    NSDateFormatter *formatter = cache[key];
     if (!formatter) {
         formatter = [[NSDateFormatter alloc] init];
-        formatter.locale = [[NSLocale alloc] initWithLocaleIdentifier:dateLocale];
+        formatter.locale = locale;
+        cache[key] = formatter;
     }
+    os_unfair_lock_unlock(&lock);
+    return formatter;
+}
+
+static NSString* formattedDate(NSString *dateFormat, NSString *dateLocale)
+{
+    if (dateFormat.length == 0) {
+        dateFormat = @"E MMM dd";
+    }
+
     NSDate *currentDate = [NSDate date];
     NSString *newDateFormat = [LunarDate getChineseCalendarWithDate:currentDate format:dateFormat];
+    NSDateFormatter *formatter = dateFormatterForLocale(resolvedDateLocale(dateLocale));
     [formatter setDateFormat:newDateFormat];
     return [formatter stringFromDate:currentDate];
 }
@@ -1620,113 +1662,6 @@ extern "C" NSString* HeliumSignalSource(void)
     return @"unavailable";
 }
 
-#pragma mark - Battery Widget
-/*
- Battery Widget Identifiers:
- 0 = Watts
- 1 = Charging Current
- 2 = Regular Amperage
- 3 = Charge Cycles
- */
-static NSString* formattedBattery(NSInteger valueType)
-{
-    NSDictionary *batteryInfo = getBatteryInfo();
-    if (batteryInfo) {
-        if (valueType == 0) {
-            // Watts
-            int watts = [batteryInfo[@"AdapterDetails"][@"Watts"] longLongValue];
-            if (watts) {
-                return [NSString stringWithFormat: @"%d W", watts];
-            } else {
-                return @"0 W";
-            }
-        } else if (valueType == 1) {
-            // Charging Current
-            double current = [batteryInfo[@"AdapterDetails"][@"Current"] doubleValue];
-            if (current) {
-                return [NSString stringWithFormat: @"%.0f mA", current];
-            } else {
-                return @"0 mA";
-            }
-        } else if (valueType == 2) {
-            // Regular Amperage
-            double amps = [batteryInfo[@"Amperage"] doubleValue];
-            if (amps) {
-                return [NSString stringWithFormat: @"%.0f mA", amps];
-            } else {
-                return @"0 mA";
-            }
-        } else if (valueType == 3) {
-            // Charge Cycles
-            return [batteryInfo[@"CycleCount"] stringValue];
-        } else {
-            return @"???";
-        }
-    }
-    return @"??";
-}
-
-#pragma mark - Current Capacity Widget
-static NSString* formattedCurrentCapacity(BOOL showPercentage)
-{
-    NSDictionary *batteryInfo = getBatteryInfo();
-    if (batteryInfo) {
-        return [
-            NSString stringWithFormat: @"%@%@",
-            [batteryInfo[@"CurrentCapacity"] stringValue],
-            showPercentage ? @"%" : @""
-            ];
-    }
-    return @"??%";
-}
-
-#pragma mark - Charging Symbol Widget
-static NSString* formattedChargingSymbol(BOOL filled)
-{
-    [[UIDevice currentDevice] setBatteryMonitoringEnabled: YES];
-    if ([[UIDevice currentDevice] batteryState] != UIDeviceBatteryStateUnplugged) {
-        if (filled) {
-            return @"bolt.fill";
-        } else {
-            return @"bolt";
-        }
-    }
-    return @"";
-}
-
-/// 取（并缓存）充电符号那张已经染好色的位图。
-///
-/// `imageWithTintColor:` 是实打实的栅格化，而 `formatParsedInfo` 原来每个 tick 都
-/// 重新走一遍「systemImageNamed: + configurationWithPointSize: + imageWithTintColor:」
-/// 再造一个 `NSTextAttachment`。名字、字号、颜色三者相同就是同一张图。
-///
-/// 缓存有上界（16）：字号和颜色是用户可改的，改一次就多一个键；上界到了就不再往里
-/// 放，只是退化成「不缓存」，不会一直涨。
-static UIImage *chargingSymbolImage(NSString *name, double fontSize, UIColor *textColor)
-{
-    static NSMutableDictionary<NSString *, UIImage *> *cache = nil;
-    static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
-
-    NSString *key = [NSString stringWithFormat:@"%@|%.2f|%lu",
-                     name, fontSize, (unsigned long)textColor.hash];
-
-    os_unfair_lock_lock(&lock);
-    if (!cache) cache = [NSMutableDictionary dictionary];
-    UIImage *hit = cache[key];
-    os_unfair_lock_unlock(&lock);
-    if (hit) return hit;
-
-    UIImage *image = [[UIImage systemImageNamed:name
-                              withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:fontSize]]
-                      imageWithTintColor:textColor];
-
-    if (image) {
-        os_unfair_lock_lock(&lock);
-        if (cache.count < 16) cache[key] = image;
-        os_unfair_lock_unlock(&lock);
-    }
-    return image;
-}
 
 
 #pragma mark - Main Widget Functions
@@ -1736,11 +1671,8 @@ static UIImage *chargingSymbolImage(NSString *name, double fontSize, UIColor *te
  1 = Date
  2 = Network Up/Down
  3 = Device Temp
- 4 = Battery Detail
  5 = Time
  6 = Text
- 7 = Battery Percentage
- 8 = Charging Symbol
  10 = CPU Temp (SoC die temperature via IOReport)
 
  TODO:
@@ -1749,8 +1681,6 @@ static UIImage *chargingSymbolImage(NSString *name, double fontSize, UIColor *te
 void formatParsedInfo(NSDictionary *parsedInfo, NSInteger parsedID, NSMutableAttributedString *mutableString, double fontSize, UIColor *textColor, NSString *apiKey, NSString *dateLocale)
 {
     NSString *widgetString;
-    NSString *sfSymbolName;
-    NSTextAttachment *imageAttachment;
     switch (parsedID) {
         case 1:
         case 5:
@@ -1777,35 +1707,9 @@ void formatParsedInfo(NSDictionary *parsedInfo, NSInteger parsedID, NSMutableAtt
                 [parsedInfo valueForKey:@"useFahrenheit"] ? [[parsedInfo valueForKey:@"useFahrenheit"] boolValue] : NO
             );
             break;
-        case 4:
-            // Battery Stats
-            widgetString = formattedBattery(
-                [parsedInfo valueForKey:@"batteryValueType"] ? [[parsedInfo valueForKey:@"batteryValueType"] integerValue] : 0
-            );
-            break;
         case 6:
             // Text
             widgetString = [parsedInfo valueForKey:@"text"] ? [parsedInfo valueForKey:@"text"] : @"Unknown";
-            break;
-        case 7:
-            // Current Capacity
-            widgetString = formattedCurrentCapacity(
-                [parsedInfo valueForKey:@"showPercentage"] ? [[parsedInfo valueForKey:@"showPercentage"] boolValue] : YES
-            );
-            break;
-        case 8:
-            // Charging Symbol
-            sfSymbolName = formattedChargingSymbol(
-                [parsedInfo valueForKey:@"filled"] ? [[parsedInfo valueForKey:@"filled"] boolValue] : YES
-            );
-            if (![sfSymbolName isEqualToString:@""]) {
-                UIImage *symbolImage = chargingSymbolImage(sfSymbolName, fontSize, textColor);
-                if (symbolImage) {
-                    imageAttachment = [[NSTextAttachment alloc] init];
-                    imageAttachment.image = symbolImage;
-                    [mutableString appendAttributedString:[NSAttributedString attributedStringWithAttachment:imageAttachment]];
-                }
-            }
             break;
         case 10:
             // CPU Temp
