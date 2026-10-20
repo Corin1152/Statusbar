@@ -76,12 +76,6 @@
 "Temperature Unit" = "温度单位";
 "Celcius" = "摄氏度";
 "Fahrenheit" = "华氏度";
-"Battery Option" = "电池选项";
-"Watts" = "瓦特";
-"Charging Current" = "充电电流";
-"Amperage" = "使用电流";
-"Charge Cycles" = "充电周期";
-"Current Capacity" = "当前容量";
 "Time Format" = "时间格式";
 "Label Text" = "标签文本";
 "Example" = "示例";
@@ -112,7 +106,6 @@
 "Available" = "可用";
 "Unavailable - check the CommCenter entitlement" = "不可用 —— 请检查 CommCenter 权限";
 "Checking…" = "检查中…";
-"Fill Symbol" = "填充符号";
 "No Configurable Aspects" = "无可配置项";
 "Save Changes" = "保存更改";
 "Would you like to save changes to the widget?" = "是否保存对小部件的更改？";
@@ -194,12 +187,9 @@
 "Mon Oct 16" = "10月16 周一";
 "Network" = "网速";
 "Device Temperature" = "设备温度";
-"Battery Details" = "电池详情";
 "Time" = "时间";
 "Text Label" = "文本标签";
 "Example" = "示例";
-"Battery Capacity" = "电池容量";
-"Charging Symbol" = "充电符号";
 "CPU Temperature" = "CPU温度";
 "CPU Usage" = "CPU占用";
 "CPU Frequency" = "CPU频率";
